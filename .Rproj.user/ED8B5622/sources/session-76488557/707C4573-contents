@@ -1,0 +1,497 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 2 - test different resolutions"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+
+# 1. Load the pathing and python integration libraries first
+library(here)
+library(reticulate)
+
+# 2. Define the path to the local environment using here()
+# This ensures it finds the root folder whether you are running interactively OR knitting!
+local_env_path <- here::here("scvi-env")
+
+# 3. Bind reticulate to the correct environment BEFORE any python code runs
+if (dir.exists(local_env_path)) {
+  message("Matching local environment found at: ", local_env_path)
+  reticulate::use_virtualenv(local_env_path, required = TRUE)
+} else {
+  # stop() throws a fatal error and completely halts execution/knitting
+  stop(
+    "\n=========================================================================\n",
+    "CRITICAL ERROR: Local Python environment 'scvi-env' not found!\n",
+    "Execution halted. Please follow the instructions in the project README.md\n",
+    "to build the virtual environment before running this script.\n",
+    "========================================================================="
+  )
+}
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the single cell RNA sequencing.
+
+```{r libraries}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+# # install CRAN packages via BioConductor as well
+# if (!"BiocManager" %in% installed.packages()[,"Package"]){
+#   install.packages("BiocManager")
+# }
+# list.of.packages <- c("ggplot2", "ComplexHeatmap", "tidyHeatmap", 
+#                       "circlize", "limma", "edgeR", "dplyr", "tidyr",
+#                       "UpSetR", "ComplexUpset", "VennDiagram", "readr", "openxlsx", "readxl", 
+#                       "ggmagnify", "readr", "ggrepel")
+# new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
+# if(length(new.packages)) BiocManager::install(new.packages)
+
+library(Seurat)
+library(DoubletFinder) # for doublet detection
+library(scDblFinder) # a newer doublet detection tool
+library(SeuratWrappers)
+library(monocle3)
+library(ggplot2)
+library(patchwork) # to combine plots
+library(ggforce) # to add ellipse?
+library(Matrix)
+library(dplyr)
+library(here)
+library(stringr) # for the string replacements
+library(future) # for parallel Seurat runs
+library(clustree) # to visualize clusters
+library(scCustomize) # use scVI for integration, such as in Saldana-Guerero
+library(RColorBrewer)
+# for concave hulls:
+library(ggforce)
+library(concaveman)
+library(openxlsx)
+```
+
+
+Folder structure
+```{r}
+Datafolder     <- here("Data")
+Data_calc <- here("Data_calculated") # Path to find Part 1 outputs
+
+# Subdirectories specifically isolated for this run's outputs
+Figures   <- here(file.path("Figures", "integraton_and_markers"))
+Data_calc <- here("Data_calculated")
+Results   <- here("Results")
+
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+
+utils_file <- here("Rscripts","utils.R")
+if (file.exists(utils_file)) source(utils_file)
+```
+
+
+
+Read in normalized data and integrate separately for each cell type
+```{r}
+
+marker_list <- list(
+  proliferation = c("CDK1", "CENPF", "TOP2A", "UBE2C"), #vanHaver
+  #sympathoblast = c("CDK1", "PRPH", "ELAVL4", "ELAVL3", "ELAVL2", "ISL1", "STMN2", "GAP43", "GATA3", "PHOX2B", "SOX11", "TFAP2B",  "HMX1"), 
+  sympathoblast = c("PRPH", "ELAVL2", "ELAVL3", "ELAVL4", "ISL1","STMN2", "STMN4", "GAP43", "GATA3", "PHOX2B", "SOX11", "SOX11", "TFAP2B"), #vanHaver
+  chromaffin = c("ADM", "CARTPT", "CHGA", "CHGB", "DBH", "DDC", "DLK1", "EGR1", "FOS", "JUNB", "PENK", "PNMT", "TH"), #vanHaver
+  bridging = c("ASCL1", "MEIS1"), #vanHaver
+  SCP = c("CDH19", "EDNRB", "ERBB3", "ERBB4", "FTS1", "FOXD3", "MPZ", "NR2F2", "PLP1", "SOX10", "SOX2", "SPARC"), #vanHaver
+  #SCP_other = c("SOX10", "PLP1", "FOXD3", "FABP7", "S100B", "ERBB3", "NGFR", "MPZ", "COL2A1", "POSTN", "MOXD1", "GAS7", "ASCL1"), 
+  MES = c("COL1A1", "COL1A2", "COL12A1", "COL3A1", "VIM", "CXCL12", "TWIST1", "TWIST2") #Saldana fig2
+)
+
+nHVG <- 2000 # 2000 is usually enough to capture sub-states. (5000 HVGs might be too many for a single cell type.)
+nHVG_str <- as.character(nHVG)
+for (ct in c("EpiC", "kolf2")){
+# for (ct in c("EpiC")){
+# for (ct in c("kolf2")){
+  outfile <- file.path(Data_calc, "seu_final.rds")
+  seu.norm <- LoadSeuratRds(file=outfile) # it is not yet normalized, but will be
+  # write out cell numbers
+  table(seu.norm@meta.data$sample.names)
+  
+  
+  # Initialize a list to store latent embeddings
+  latent_list <- list()
+  
+  # now we will use Python functions - a Python environment is required for this
+  # library(reticulate)
+  reticulate::use_virtualenv(here("scvi-env"), required = TRUE)
+  #Force R to initialize Python and check the configuration
+  py_config()
+  # Python packages
+  scvi <- import("scvi")
+  ad <- import("anndata")
+  sp <- import("scipy.sparse") # to create CSR type matrix from sparse
+  options(future.globals.maxSize = 2000 * 1024^2)
+  message("Starting integration for: ", ct)
+  seu.subset <- seu.norm
+  seu.cell <- subset(seu.norm, subset = sample.names %in% grep(ct, unique(sample.names), value = TRUE))
+  seu.cell <- JoinLayers(seu.cell) # before splitting, layers should be joined
+  table(seu.cell@meta.data$sample.names)
+  # Run SCTransform to select the higly variable features to use for integration
+  seu.cell[["RNA"]] <- split(seu.cell[["RNA"]], f = seu.cell$sample.names) # split before
+  seu.cell <- SCTransform(
+    seu.cell, 
+    method = "glmGamPoi", # glmGamPoi for speed and accuracy
+    variable.features.n = nHVG, 
+    #vars.to.regress = c("ccvar", "percent.mito"),
+    #vars.to.regress = c("ccvar"), # preserves the signal of "proliferating vs. non-proliferating" while removing the "G2M vs. S phase" noise
+    verbose = TRUE
+  )
+  # rejoin for transforming to anndata
+  DefaultAssay(seu.cell) <- "RNA"
+  seu.cell <- JoinLayers(seu.cell) # only the counts can be joined
+  
+  seu.hvg <- seu.cell[VariableFeatures(seu.cell), ]
+  
+  # rejoin for transforming to anndata
+  DefaultAssay(seu.cell) <- "RNA"
+  seu.cell <- JoinLayers(seu.cell) # only the counts can be joined
+  # outfile <- file.path(Data_calc, paste("seu_merged_nHVG", as.character(nHVG), "_", ct, ".rds", sep=""))
+  # SaveSeuratRds(seu.cell, file=outfile)
+  
+  seu.integrated <- seu.cell[intersect(rownames(seu.cell),VariableFeatures(seu.cell, assay="SCT")),]
+  
+  # 2. Convert to AnnData
+  adata_sub <- as.anndata(
+    x = seu.hvg, 
+    assay = "RNA", 
+    main_layer = "counts",
+    other_layers = NULL,
+    file_path = Data_calc, file_name = paste("seu_hvg_anndata_converted_", ct, "_all_nHVG", nHVG_str, ".h5ad", sep="")
+  )
+  print(adata_sub)
+  adata_sub$X <- sp$csr_matrix(adata_sub$X)  # convert to sparse matrix
+  # 3. Setup and Train scVI
+  scvi$model$SCVI$setup_anndata(adata_sub, batch_key = "sample.names", 
+                                #continuous_covariate_keys="ccvar",
+                                continuous_covariate_keys=list("S.Score", "G2M.Score"))
+  # For single cell types, you can often reduce n_latent (e.g., 10-15) unless the cell type is very complex.
+  model_sub <- scvi$model$SCVI(adata_sub, n_layers = as.integer(2), n_latent = as.integer(20))
+  model_sub$train(max_epochs = as.integer(500), early_stopping = TRUE)
+  # 4. Extract Latent
+  lat_sub <- model_sub$get_latent_representation()
+  lat_sub <- as.matrix(lat_sub)
+  rownames(lat_sub) <- colnames(seu.cell)
+  latent_list[[ct]] <- lat_sub
+  
+  # Clean up memory to avoid crashing
+  rm(model_sub, adata_sub, seu.hvg)
+  gc()
+    
+  # rename to reflect integration
+  seu.integrated <- seu.cell
+  
+  seu.integrated[["scvi"]] <- CreateDimReducObject(
+    embeddings = as.matrix(lat_sub), 
+    key = "scvi_", 
+    assay = "RNA"
+  )
+  #seu.integrated[["scvi"]] <- CreateDimReducObject(embeddings = lat, key = "scvi_", assay = "RNA")
+  
+  ##########################################################
+  # save here
+  outfile <- file.path(Data_calc, paste("seu_integrated_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+  SaveSeuratRds(seu.integrated, file=outfile)
+  
+  # # tmp start from here
+  # outfile <- file.path(Data_calc, "seu_integrated_all.rds")
+  # seu.integrated <- LoadSeuratRds(outfile)
+  # # end of tmp
+  
+  nHVG_norm <- 2000
+  seu.integrated <- SCTransform(seu.integrated, 
+  method = "glmGamPoi", # glmGamPoi for speed and accuracy
+  variable.features.n = nHVG_norm, 
+  #vars.to.regress = c("ccvar", "percent.mito"),
+  #vars.to.regress = c("ccvar"),
+  vars.to.regress = c("S.Score", "G2M.Score"),
+  verbose = F)
+  
+  # quick visual check
+  seu.integrated <- RunPCA(seu.integrated, verbose = F)
+  seu.integrated <- RunUMAP(seu.integrated, reduction = "scvi", dims = 1:20, 
+                            verbose = F)
+  seu.integrated <- RunUMAP(seu.integrated, reduction = "pca", dims = 1:20, 
+                            reduction.name = "umap.pca", verbose = F)
+  p1 <- DimPlot(seu.integrated, reduction = "umap.pca", group.by = "sample.names") + 
+        ggtitle("Uncorrected (PCA)")
+  p2 <- DimPlot(seu.integrated, reduction = "umap", group.by = "sample.names") + 
+        ggtitle("Integrated (scVI)")
+  combined_plot <- p1 | p2
+  plot(combined_plot)
+  outfig <- file.path(Figures, paste("nonintegrated_vs_integrated_", ct, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+  ggsave(outfig, combined_plot, width=15, height = 10)
+  
+  # check whether cell cycle has been properly regressed out
+  p1 <- DimPlot(seu.integrated, group.by = "sample.names", reduction = "umap") + ggtitle("By Sample")
+  p2 <- FeaturePlot(seu.integrated, features = "S.Score", reduction = "umap") + ggtitle("S Phase Signal")
+  p1 + p2
+  
+  # decide dimensions automatically
+  stdevs <- seu.integrated[["pca"]]@stdev
+  pct <- stdevs / sum(stdevs) * 100
+  cum <- cumsum(pct)
+  co1 <- which(cum > 90)[1] # 90% of total variance explained
+  co2 <- sort(which((pct[1:(length(pct) - 1)] - pct[2:length(pct)]) > 0.1), decreasing = TRUE)[1] + 1 # Finds the last PC where the drop in variance is greater than 0.1%.
+  selected_dims <- min(co1, co2) # We take the minimum of these two to avoid including noisy, low-variance PCs.
+  # overwrite if too low!
+  if (is.na(selected_dims) || selected_dims < 10) { # fallback
+  selected_dims <-  10}
+  print(paste(ct, "| Auto-selected Dims:", selected_dims))
+  # visualise the selected elbow
+  p <- ElbowPlot(seu.integrated, ndims=ceiling(1.5*selected_dims)) + 
+    geom_vline(xintercept = selected_dims, color = "red")
+  outfig <- file.path(Figures, paste("elbow_plot_", ct, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+  ggsave(outfig, p, width=6, height = 6)
+  
+  seu.integrated <- FindNeighbors(object = seu.integrated, dims = 1:selected_dims)
+  seu.integrated <- FindClusters(object = seu.integrated, resolution = seq(0.1, 1.2, by=0.1)) # try different resolutions
+  #seu.integrated <- FindClusters(object = seu.integrated, resolution = seq(1.5, 1.8, by=0.1)) # try different resolutions
+  p <- clustree::clustree(seu.integrated@meta.data[,grep("SCT_snn_res", colnames(seu.integrated@meta.data))],
+                   prefix = "SCT_snn_res.")
+  outfig <- file.path(Figures, paste("clustree_", ct, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+  ggsave(outfig, p, width=20, height = 20)
+  
+  
+  seu.integrated <- RunUMAP(object = seu.integrated, dims = 1:selected_dims)
+  
+  # save here as well
+  outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+  SaveSeuratRds(seu.integrated, file=outfile)
+  
+  
+  res_vector <- c("SCT_snn_res.0.1", "SCT_snn_res.0.2",
+                 "SCT_snn_res.0.3", "SCT_snn_res.0.4",
+                "SCT_snn_res.0.5", "SCT_snn_res.0.6",
+                "SCT_snn_res.0.7", "SCT_snn_res.0.8",
+                "SCT_snn_res.0.9", "SCT_snn_res.1",
+                "SCT_snn_res.1.1", "SCT_snn_res.1.2")
+                # "SCT_snn_res.1.3", "SCT_snn_res.1.4",
+                # "SCT_snn_res.1.5", "SCT_snn_res.1.6",
+                # "SCT_snn_res.1.7", "SCT_snn_res.1.8")
+  p <- DimPlot(seu.integrated, reduction = "umap", group.by = res_vector)
+  outfig <- file.path(Figures, paste("clustree_umap_", ct, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+  ggsave(outfig, p, width=20, height = 20)
+
+  
+  # selres <- "SCT_snn_res.0.9"
+  top_markers_outer_list <- list()
+  wb <- createWorkbook()
+  for (selres in res_vector){
+    seu.integrated@meta.data$seurat_clusters <- seu.integrated@meta.data[[selres]]
+    Idents(seu.integrated) <- selres
+    # checks:
+    cluster_sample_table <- table(
+      #Cluster = Idents(seu.integrated),
+      Cluster = seu.integrated@meta.data$seurat_clusters,
+      Sample  = seu.integrated$sample.names
+    )
+    # print(cluster_sample_table)
+    cluster_sample_prop <- prop.table(cluster_sample_table, margin = 2)
+    # print(round(cluster_sample_prop, 3))
+    # tidy version for exporting
+    cluster_sample_df <- as.data.frame(cluster_sample_table) %>%
+      group_by(Sample) %>%
+      mutate(Prop = Freq / sum(Freq))
+    
+    # visualize:
+    p <- ggplot(cluster_sample_df,
+                aes(x = Sample, y = Prop, fill = Cluster)) +
+      geom_bar(stat = "identity", width = 0.8) +
+      scale_y_continuous(labels = scales::percent_format()) +
+      labs(
+        x = NULL,
+        y = "Proportion of cells",
+        fill = "Cluster"
+      ) +
+      theme_classic() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.key.height = unit(0.4, "cm")
+      )
+    plot(p)
+    outfig <- file.path(Figures, paste("cluster_proportions_", selres, "_", ct, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+    ggsave(outfig, plot=p, width=8, height=6)
+  
+    # to plot van-Haver markers:
+    # add hulls
+    my_hulls <- get_glasswork_layers(
+          seu.integrated, 
+          clusvar = "seurat_clusters",
+          concavity = 3,         # Slightly higher concavity follows the dense core better
+          core_quantile = 0.75   # This ignores the 25% most isolated cells
+        )
+    
+    my_hulls_outline <- get_glasswork_layers_outline(
+      seu.integrated, 
+      clusvar = "seurat_clusters",
+      concavity = 3,         # Slightly higher concavity follows the dense core better
+      core_quantile = 0.75   # This ignores the 25% most isolated cells
+    )
+    
+    # 2. Add them to your plot
+    # I recommend setting alpha low on the points so the Hulls "pop"
+    p <- DimPlot(
+      seu.integrated, ncol=2,
+      reduction = "umap",
+      group.by  = "sample.names",
+      split.by  = "sample.names",
+      pt.size   = 0.1) +
+      my_hulls +
+      NoLegend() +
+      theme_void()
+    plot(p)
+    
+    outfig <- file.path(Figures, paste("clusters_samples_", ct, "_res_", selres, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+    ggsave(outfig, plot=p, width=15, height=10)
+
+
+   # Van-Haver markers - ensure genes are present
+   marker_list_filtered <- lapply(marker_list, function(genes) {
+      genes[genes %in% rownames(seu.integrated)]
+    })
+    
+    # subtracting the average expression of "control genes" from the feature genes
+    seu.integrated <- AddModuleScore(
+      seu.integrated,
+      features = marker_list_filtered,
+      name     = names(marker_list_filtered),
+      nbin     = 10
+    )
+    
+    # add nice metadata columns (names of the marker_list_filtered list plus a "1" suffix)
+    new_cols <- grep(paste0("(", paste(names(marker_list_filtered), collapse="|"), ")\\d+"), 
+                 colnames(seu.integrated@meta.data), value = TRUE)
+    marker_names <- gsub("\\d+$", "", new_cols)
+    names(marker_names) <- new_cols
+    colnames(seu.integrated@meta.data)[colnames(seu.integrated@meta.data) %in% new_cols] <- (
+      marker_names[match(colnames(seu.integrated@meta.data)[colnames(seu.integrated@meta.data) %in% new_cols], names(marker_names))])
+    
+    pp <- list()
+    for (marker_name in marker_names){
+      pp[[marker_name]] <- FeaturePlot(
+        seu.integrated, 
+        label=T, label.size = 7,
+        features  = marker_name,
+        reduction = "umap",
+        min.cutoff = "q05",
+        max.cutoff = "q95"
+      ) +
+        my_hulls_outline +
+        scale_colour_viridis_c(option = "plasma", direction = -1) +
+        NoLegend() +
+        theme_void()
+    }
+    p_combined <- pp[[1]] + pp[[2]] + pp[[3]] + pp[[4]] + pp[[5]] + pp[[6]]
+    
+    # Define the layout: 
+    layout <- "ABC
+               DEF"
+    
+    p_final <- p_combined + 
+      plot_layout(design = layout)
+    
+    plot(p_final)
+    outfig <- file.path(Figures, paste("clusters_vanHaver_markers_", ct, "_res_", selres, "_all_nHVG", nHVG_str, ".pdf", sep=""))
+    ggsave(outfig, plot=p_final, width=15, height=10)
+    
+    
+    
+     # marker detection
+    DefaultAssay(seu.integrated) <- "RNA"
+    
+    markers <- FindAllMarkers(
+      seu.integrated,
+      only.pos = TRUE,
+      test.use = "wilcox",
+      logfc.threshold = 0.25,
+      min.pct = 0.1
+    )
+    
+    top_markers <- markers %>%
+      group_by(cluster) %>%
+      slice_max(order_by = avg_log2FC, n = 20)
+    
+    # for now, filter by patterns; TO DO - filter by the gtf file!
+    top_markers_clean <- markers %>%
+      filter(!grepl("^ENSG|^LINC|\\-AS[0-9]$|^MIR|^SNHG", gene)) %>% 
+      group_by(cluster) %>%
+      slice_max(order_by = avg_log2FC, n = 50)
+    
+    # create a list for the dotplot
+    top_markers_list <- list()
+    for (cl in unique(top_markers_clean$cluster)){
+      top_markers_list[[cl]] <- top_markers_clean$gene[top_markers_clean$cluster==cl]
+    }
+  
+    gene_all <- c()
+    top_markers_flat <- top_markers_list
+    for (mname in names(top_markers_flat)){
+      top_markers_flat[[mname]] <- setdiff(top_markers_flat[[mname]], gene_all)
+      gene_all <- union(gene_all, top_markers_flat[[mname]])
+    }
+  
+    p_dot <- DotPlot(
+      seu.integrated,
+      features = top_markers_flat, # Passing the list creates grouped labels
+      cols = c("lightgrey", "red"),
+      col.min = 0,
+      dot.scale = 6,
+      assay = "SCT"
+    ) + RotatedAxis() + ggtitle("Top Markers")+
+      theme(
+    axis.text.x = element_text(size = 7))
+    plot(p_dot)
+    
+    ggsave(file.path(Figures, paste("Top_Markers_DotPlot_", ct, "_selres_", 
+              selres, "_all_nHVG", nHVG_str, ".pdf", sep="")), p_dot, 
+           width = length(top_markers_list)*5.5, height = 6, limitsize = FALSE)
+  
+    # write markers to file
+      # save top_markers_list
+    max_len <- max(sapply(top_markers_list, length))
+    padded_list <- lapply(top_markers_list, function(x) {
+      length(x) <- max_len
+      return(x)}
+      ) # 2. Pad shorter lists with NA so they all match max_len
+    padded_df <- as.data.frame(padded_list) # now there will be column names
+    colnames(padded_df) <- gsub("X", "Cluster_", colnames(padded_df))
+    top_markers_outer_list[[selres]] <- padded_df
+  
+    # 2. Add a new sheet for EACH resolution inside the loop
+    # Clean the name (Excel sheets can't have certain characters or be too long)
+    sheet_name <- substr(gsub("[^[:alnum:]]", "_", selres), 1, 31) 
+    addWorksheet(wb, sheetName = sheet_name)
+    writeData(wb, sheet = sheet_name, x = padded_df)
+    #
+  
+
+  } # loop for selres
+  # 3. Save the final workbook
+  saveWorkbook(wb, file.path(Results, paste("Top_Markers_By_Sample_", ct, "_all_nHVG", nHVG_str, ".xlsx", sep="")), overwrite = TRUE)
+
+} # loop for celltype
+
+```
+
+
+
+

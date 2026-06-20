@@ -1,0 +1,870 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 1 - quality control"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the single cell RNA sequencing.
+
+```{r libraries, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+# # install CRAN packages via BioConductor as well
+# if (!"BiocManager" %in% installed.packages()[,"Package"]){
+#   install.packages("BiocManager")
+# }
+# list.of.packages <- c("ggplot2", "ComplexHeatmap", "tidyHeatmap", 
+#                       "circlize", "limma", "edgeR", "dplyr", "tidyr",
+#                       "UpSetR", "ComplexUpset", "VennDiagram", "readr", "openxlsx", "readxl", 
+#                       "ggmagnify", "readr", "ggrepel")
+# new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
+# if(length(new.packages)) BiocManager::install(new.packages)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(DoubletFinder) # for doublet detection
+  library(scDblFinder) # a newer doublet detection tool
+  library(SeuratWrappers)
+  library(glmGamPoi)
+  library(monocle3)
+  library(ggplot2)
+  library(patchwork) # to combine plots
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(here)
+  library(stringr) # for the string replacements
+  library(future) # for parallel Seurat runs
+  library(clustree) # to visualize clusters
+  library(biomaRt) # to convert ensembl id-s
+})
+```
+
+
+<!-- # Biztosan kellene sejt -->
+<!-- # populáció/cluster azonosítás marker gének alapján, pseudotime analízis -->
+<!-- # és CellChat vagy CellPhoneDB analízis is -> do CellChat: https://github.com/jinworks/CellChat1 -->
+
+
+<!-- # # order of analysis -->
+<!-- # Per-sample QC (low nFeature, high percent.mito, extreme high nFeature outliers) -->
+<!-- # Per-sample doublet detection and removal -->
+<!-- # Per-sample XXY detection and removal -->
+<!-- # Merge cleaned samples & save -->
+
+<!-- # # note (Gemini) -->
+<!-- # If you want to move away from the "list" approach and stay within one object (which is much more memory-efficient), you can do this: -->
+<!-- #   Keep it as one object: Don't use SplitObject. -->
+<!-- #     Split the Layers: seu[["RNA"]] <- split(seu[["RNA"]], f = seu$sample.names) -->
+<!-- #     Run SCTransform: It will automatically run across all layers separately. -->
+
+
+### Quality Control and Feature CalculationFolder structure is defined first.
+```{r folder structure, warning = FALSE, message = FALSE}
+Datafolder <- here("Data")
+Figures    <- here(file.path("Figures", "QC"))
+Data_calc  <- here("Data_calculated")
+Results    <- here("Results")
+
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+```
+
+### Analysis input
+<!-- Read in count tables and corresponding feature matrices one by one. -->
+```{r read in count tables and feature matrices, warning = FALSE, message = FALSE}
+countfolder <- file.path(Datafolder, "count_matrix")
+
+all_files <- list.files(countfolder, pattern = "matrix.mtx.gz")
+prefixes  <- sub("_matrix.mtx.gz", "", all_files)
+prefixes  <- sort(prefixes) 
+
+proper_names <- c("1_EpiC_MIX_D26",
+                  "2_EpiC_STOP_MYCN_D26",
+                  "3_EpiC_STOP_MYCN_D42",
+                  "4_EpiC_STOP_MYCN_D42_hTH",
+                  "5_kolf2_MIX_D26",
+                  "6_kolf2_STOP_MYCN_D26",
+                  "7_kolf2_STOP_MYCN_D42",
+                  "8_kolf2_STOP_MYCN_D42_hTH")
+
+data.list <- list()
+seu.list <- list()
+
+# HIGHLIGHTED FIX: Extracts realpath dependencies cleanly through Symlinks via ReadMtx
+for (si in 1:length(prefixes)){
+  mtx_file  <- file.path(countfolder, paste0(prefixes[si], "_matrix.mtx.gz"))
+  cells_file <- file.path(countfolder, paste0(prefixes[si], "_barcodes.tsv.gz"))
+  features_file <- file.path(countfolder, paste0(prefixes[si], "_features.tsv.gz"))
+  
+  counts <- ReadMtx(mtx = mtx_file, cells = cells_file, features = features_file)
+  seu.list[[si]] <- CreateSeuratObject(counts = counts, project = proper_names[si])
+}
+
+seu <- merge(x = seu.list[[1]], 
+             y = seu.list[2:length(seu.list)], add.cell.ids = proper_names)
+  
+orig_idents <- as.character(c(1:8))
+names(proper_names) <- orig_idents
+seu@meta.data$sample.names <- proper_names[as.character(seu$orig.ident)]
+
+cat("cell numbers:\n")
+print(table(seu@meta.data$sample.names))
+```
+
+
+### Quality Control and Feature Calculation
+
+This analysis step focuses on assessing the quality of the single-cell dataset by visualizing key metrics and calculating the percentage of specific gene families (mitochondrial, ribosomal, and hemoglobin). For our samples, hemoglobin represents noise.
+
+* **Correlation Analysis (`FeatureScatter`):** Generates scatter plots to visualize the relationship between the total number of RNA molecules (`nCount_RNA`) and unique genes (`nFeature_RNA`) detected per cell. A strong linear correlation typically indicates high-quality cells.
+* **Violin Plots (`VlnPlot`):** Provides a distribution overview of sequencing depth and gene complexity across different samples. This helps identify if any specific sample suffered from lower library complexity.
+* **Mitochondrial Content (`percent.mito`):** Calculates the percentage of reads mapping to mitochondrial genes. High mitochondrial content is a common indicator of cell stress or membrane rupture, which allows cytoplasmic RNA to leak out while retaining heavier mitochondria.
+* **Ribosomal Content (`percent.ribo`):** Identifies the proportion of ribosomal protein genes. This reflects the translational activity of the cells and can vary significantly by cell type.
+* **Hemoglobin Contamination (`percent.globin`):** Screens for hemoglobin genes (`^HB[^(P)]`) to detect potential red blood cell contamination or ambient RNA from lysed red blood cells.
+
+All plots are displayed in the notebook and saved to the `Figures` directory as PDFs for high-resolution reporting.
+```{r initial quality check, warning = FALSE, message = FALSE}
+# some QC plots
+p <- Seurat::FeatureScatter(seu, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",
+                            group.by = "sample.names", split.by="sample.names", 
+                            ncol=4, plot.cor = F)+
+                       ggplot2::theme(legend.position = "none")
+plot(p)
+outfig <- file.path(Figures, "nCount_vs_nFeature_orig.pdf")
+ggsave(outfig, plot=p, height=12, width=15, units="in")
+# nCount_RNA - The Total Number of RNA Molecules (UMIs) detected in that cell.
+# nFeature_RNA - The Total Number of Unique Genes detected in that cell.
+
+p <- Seurat::VlnPlot(seu, features = c("nCount_RNA",  "nFeature_RNA"),
+                     group.by = "sample.names") 
+# warnings can be ignored, since there are cell level metrics
+plot(p)
+outfig <- file.path(Figures, "violinplot_nCount_nFeature_orig.pdf")
+ggsave(outfig, plot=p, width=10, height=6.4, units="in")
+
+# mitochondrial genes (~damaged cells)
+seu <- Seurat::PercentageFeatureSet(seu, 
+                                    pattern = "^MT-", 
+                                    col.name = "percent.mito")
+
+# ribosomal genes (~translational activity)
+seu <- Seurat::PercentageFeatureSet(seu, 
+                                    pattern = "^RP[SL]",
+                                    col.name = "percent.ribo")
+
+# hemoglobin genes (~in this caste, contamination)
+seu <- Seurat::PercentageFeatureSet(seu,
+                                    pattern = "^HB[^(P)]",
+                                    col.name = "percent.globin")
+
+
+p <- Seurat::VlnPlot(seu, features = c("percent.mito",
+                                       "percent.ribo",
+                                       "percent.globin"),
+                     group.by = "sample.names", ncol=3)
+plot(p)
+ggsave(file.path(Figures, "Violin_mito_ribo_globin_orig.pdf"), 
+       height=10, width=15)
+```
+
+### Adaptive Cell Filtering and Outlier Detection
+
+This section implements a robust, sample-specific filtering strategy to remove low-quality cells and potential doublets using Median Absolute Deviation (MAD) and safety guards.
+
+* **Automated Thresholding (3 MADs):** For each sample, we calculate thresholds based on the **Median Absolute Deviation (MAD)**. This is more robust to outliers than standard deviation.
+    * **Minimum Features:** Defined as 3 MADs below the median to remove empty droplets or poorly sequenced cells.
+    * **Maximum Mitochondrial Content:** Defined as 3 MADs above the median to identify stressed or dying cells.
+    * **99th Percentile:** Used for `nFeature_RNA` to identify potential doublets (cells with unusually high gene counts).
+* **Safety Guards:** To prevent the statistical thresholds from becoming too aggressive or too lenient, we apply "floors" and "ceilings":
+    * `final_min_feat`: Never drops below **200 genes**, ensuring a baseline of information.
+    * `final_max_mito`: Capped at **15%**, as anything higher typically indicates non-viable cells regardless of the distribution. THIS WAS CHANGED LATER AS ANALYSIS SHOWED THAT TUMOR FORMING CELLS HAD HIGHER MITOCHONDRIAL GENE PERCENTAGE.
+* **Visual Validation:** The code iterates through each sample, generating histograms for `percent.mito` and `nFeature_RNA`. Red dashed lines indicate the calculated thresholds, allowing for a manual "sanity check" before data removal.
+
+This approach ensures that high-quality cells in a naturally "complex" sample aren't accidentally discarded just because they look like outliers compared to a "lower-complexity" sample.
+<!-- Per sample filtering: remove empty noise (min of nfeature), remove highly stressed cells (max of percent.mito), remove doublets (max of nfeature) -->
+```{r outlier detection, warning = FALSE, message = FALSE}
+# 1. Calculate thresholds automatically based on 3 MADs
+md_new <- seu@meta.data %>%
+  group_by(sample.names) %>%
+  summarise(
+    mad_min_feat = median(nFeature_RNA) - (3 * mad(nFeature_RNA)),
+    mad_max_mito = median(percent.mito) + (3 * mad(percent.mito)),
+    quant_max_feat = quantile(nFeature_RNA, 0.99),
+    .groups = "drop"
+  )
+
+seu <- AddMetaData(
+  seu,
+  metadata = md_new[match(seu$sample.names, md_new$sample.names), -1]
+)
+
+# check, if needed
+sbounds <- aggregate(cbind(mad_min_feat, mad_max_mito, quant_max_feat) ~ sample.names, 
+          data = seu@meta.data, FUN = unique)
+print(sbounds)
+
+# 2. Add "Safety Guards"
+# Sometimes 3 MADs can be too aggressive; we set absolute floors/ceilings
+seu$final_min_feat <- pmax(seu$mad_min_feat, 200) # Never lower than 200
+seu$final_max_feat <- seu$quant_max_feat # if the distribution has a long tail, this should work -> check visually!
+seu$final_max_mito <- pmin(seu$mad_max_mito, 20)  # Never higher than 15%
+
+# before the actual filtering, create plots
+for (sname in unique(seu@meta.data$sample.names)) {
+  sobj <- subset(seu, subset = sample.names==sname)
+  current_min_feat <- unique(sobj$final_min_feat)
+  current_max_feat <- unique(sobj$final_max_feat)
+  current_max_mito <- unique(sobj$final_max_mito)
+  
+  p1 <- ggplot(sobj@meta.data, aes(x = percent.mito)) +
+    geom_histogram(binwidth = current_max_mito/90) +
+    coord_cartesian(xlim = c(0, 1.1*current_max_mito)) + # <- Use this for zooming!
+    geom_vline(xintercept=current_max_mito, color="red", linetype="dashed")
+  #plot(p1)
+  
+  p2 <- ggplot(sobj@meta.data, aes(x = nFeature_RNA)) +
+    geom_histogram(binwidth = current_max_feat/90) +
+    coord_cartesian(xlim = c(0, 1.1*current_max_feat)) + # <- Use this for zooming!
+    geom_vline(xintercept=current_min_feat, color="red", linetype="dashed")+
+    geom_vline(xintercept=current_max_feat, color="red", linetype="dashed")
+  #plot(p2)
+  
+  # save all
+  combined_plot <- p1 / p2
+  print(paste("Filtering of ", sname, sep=""))
+  plot(combined_plot)
+  outfig <- file.path(Figures, paste("QC_orig_", sname, ".pdf", sep=""))
+  ggsave(outfig, plot=combined_plot, width=10, height = 15)
+}
+
+# 3. Filter the whole object in one go
+seu.qc <- subset(
+  seu, 
+  subset = nFeature_RNA > final_min_feat & 
+          nFeature_RNA < final_max_feat & 
+           percent.mito < final_max_mito
+)
+
+# # save at this point
+# seu.qc <- merge(qc.list[[1]], qc.list[-1])
+# outfile <- file.path(Data_calc, "seu_qc.rds")
+# SaveSeuratRds(seu.qc, file=outfile)
+
+
+```
+
+
+### Post-QC Data Validation
+
+After applying the adaptive filtering thresholds, we re-visualize the data to ensure the remaining cell population meets our quality standards. This "before and after" comparison is essential for confirming that the filtering successfully removed artifacts without over-cleansing the data.
+
+The resulting figures are saved with the `_qc.pdf` suffix to distinguish them from the initial exploratory plots.
+```{r intermediate quality check, warning = FALSE, message = FALSE}
+
+# plot after qc plots
+p <- Seurat::FeatureScatter(seu.qc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",
+                            group.by = "sample.names", split.by="sample.names", 
+                            ncol=4, plot.cor = F)+
+                       ggplot2::theme(legend.position = "none")
+plot(p)
+outfig <- file.path(Figures, "nCount_vs_nFeature_qc.pdf")
+ggsave(outfig, plot=p, height=12, width=15, units="in")
+
+p <- Seurat::VlnPlot(seu.qc, features = c("nCount_RNA",  "nFeature_RNA"),
+                     group.by = "sample.names") 
+plot(p)
+outfig <- file.path(Figures, "violinplot_nCount_nFeature_qc.pdf")
+ggsave(outfig, plot=p, width=10, height=6.4, units="in")
+
+p <- Seurat::VlnPlot(seu.qc, features = c("percent.mito",
+                                       "percent.ribo",
+                                       "percent.globin"),
+                     group.by = "sample.names", ncol=3)
+plot(p)
+ggsave(file.path(Figures, "Violin_mito_ribo_globin_qc.pdf"), 
+       height=10, width=15)
+```
+
+
+
+### Iterative Multiplet Detection and Kinetic Confinement QC
+
+This stage of the pipeline identifies and removes "multiplets"—instances where multiple cells were captured within the same kinetic confinement site.
+
+* **Iterative scDblFinder Convergence:**
+    * The algorithm uses an automated loop to determine the most accurate **Multiplet Rate**. Starting with a prior (7%), it runs `scDblFinder` and compares the observed results to the expectation.  It utilizes a "damping factor" to adjust the prior rate across up to 10 iterations until the observed rate and prior rate converge. 
+* **XXY Cell Detection:**
+    * Beyond predicted technical multiplets, we identify biological anomalies or physical cell-cell associations by checking for the simultaneous expression of female-linked (`XIST`) and male-linked (`KDM5D`, `RPS4Y1`) markers. Cells expressing both signatures are flagged as **XXY** and excluded.
+* **Visual Validation via Violin Plots:**
+    * Total number of RNA molecules (`nCount_RNA`) and unique genes (`nFeature_RNA`) are expected to be higher in detected doublets.
+* **Visual Validation via Distribution Plot:**
+    * In high-quality data, we expect to see a clear separation. The majority of cells (singlets) cluster at the lower end of the score range (grey), while identified multiplets (red) occupy the higher end of the spectrum.
+* **Visual Validation via Dimensionality Reduction:**
+    * To validate the statistical predictions, we perform a "mini-analysis" (Normalization, PCA, and UMAP) for each sample. While true multiplets often appear as "bridges" between clusters, they can also appear randomly scattered within clusters if the confined cells are of the same or similar types. Given the complex nature of organoids and the consistency of the other QC metrics, cells scored as multiplets were accepted as such and flagged for removal.
+* **Final Data Cleaning:**
+    * A summary bar chart tracks the percentage of cells flagged for removal per sample. 
+
+The validation plots are saved to the `Figures` folder.
+```{r multiplet removal, warning = FALSE, message = FALSE, results='asis', fig.show='hold'}
+# if multiplets were already removed, read in seurat object and corresponding data
+outfile <- file.path(Data_calc, "seu_qc_tmp.rds")
+output_list_file <- file.path(Data_calc, "output_list.rds")
+if (file.exists(outfile)){
+  seu.qc <- LoadSeuratRds(outfile)
+  output_list <- readRDS(output_list_file)
+  # create the tables and the plots - read in output_list
+  for (iter in 1:length(output_list[["iteration"]])){
+    dbrate <- round(output_list[["iteration_history"]]$prior_rate[iter], 4)
+    print(paste("Iteration:", iter, "| Current prior dbrate:", 
+                dbrate))
+    # obtain doublet score distribution
+    scores <- output_list[["iteration"]][[iter]][["scores"]]
+    # Plot the distribution
+    p <- ggplot(scores, aes(x = scDblFinder.score, fill = scDblFinder.class)) +
+      geom_histogram(bins = 100, alpha = 0.7, position = "identity") +
+      scale_fill_manual(values = c("doublet" = "red", "singlet" = "grey")) +
+      theme_minimal() +
+      labs(title = "Doublet Score Distribution",
+           subtitle = paste("Current Prior Rate:", dbrate),
+           x = "scDblFinder Score", y = "Cell Count") +
+      facet_wrap(~sample.names, ncol=2)
+      plot(p)
+    
+    #print(doublet_stats)
+    doublet_stats <- output_list[["iteration"]][[iter]][["doublet_stats"]]
+    knitr::kable(table(doublet_stats))
+    
+    calc_dbrate <- round(output_list[["iteration_history"]]$observed_rate[iter], 4)
+    if (iter == length(output_list[["iteration"]])){ 
+      print(paste("Observed rate was", round(calc_dbrate, 4), "- convergence reached."))
+    } else {
+      print(paste("Observed rate was", round(calc_dbrate, 4), "- adjusting prior."))
+    }
+  }
+  
+  # Check how doublets and singlets differ in QC measures per sample.
+  p <- VlnPlot(seu.qc, group.by = 'sample.names', split.by = "scDblFinder.class",
+          features = c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent.ribo"), 
+          ncol = 2, pt.size = 0) + theme(legend.position = 'right')
+  print(p) # this is supposed to be better than plot(p)
+  
+  # plot umap plots for each sample
+  plist <- list()
+  for (sname in unique(seu.qc@meta.data$sample.names)) {
+    sobj <- subset(seu.qc, subset = sample.names==sname)
+    #plist[[sname]] <-  Seurat::DimPlot(sobj, reduction = 'umap', group.by = c("scDblFinder.class"))
+    plist[[sname]] <- ggplot(sobj@meta.data, aes(x = UMAP_1_sample, y = UMAP_2_sample, color = scDblFinder.class)) +
+                          geom_point(size = 0.2) +
+                          facet_wrap(~sample.names, ncol=4) +
+                          theme_minimal()
+  }
+  
+} else {
+  # remove doublets
+  # # tmp #
+  # outfile <- file.path(Data_calc, "seu_qc.rds")
+  # seu.qc <- LoadSeuratRds(outfile)
+  # qc.list <- SplitObject(seu.qc, split.by = "sample.names")
+  # # end of tmp #
+  
+  output_list <- list()
+  
+  max_iter <- 10
+  iter <- 1
+  dbrate <- 0.07
+  dbrateok <- FALSE
+  iteration_history <- data.frame(
+    iteration = integer(),
+    prior_rate = numeric(),
+    observed_rate = numeric()
+  )
+  
+  output_list[["iteration"]] <- list()
+  while (!dbrateok && iter <= max_iter){
+    output_list[["iteration"]][[iter]] <- list()
+    print(paste("Iteration:", iter, "| Current prior dbrate:", round(dbrate, 4)))
+    # print(paste("Current doublet rate is ", dbrate, ".", sep=""))
+    mdadd <- list()
+    for (sname in unique(seu.qc@meta.data$sample.names)) {
+      # print(sname)
+      sobj <- subset(seu.qc, subset = sample.names==sname)
+    
+      # for doublet detection create SingleCellExperiment Class
+      sce <- as.SingleCellExperiment(sobj)
+      sce <- scDblFinder(sce, samples = "sample.names", verbose=F,
+                         dbr=dbrate) # manually set a prior doublet rate - this is from an organoid, so doublets are expected
+      # table(sce$scDblFinder.class)
+      #sce@colData@listData %>% as.data.frame() %>% head()
+      # Explore results and add to seurat object
+      meta_scdblfinder <- sce@colData@listData %>% as.data.frame() %>% 
+        dplyr::select(starts_with('scDblFinder')) # 'scDblFinder.class')
+      #head(meta_scdblfinder)
+      rownames(meta_scdblfinder) <- sce@colData@rownames
+      # IMPORTANT: rownames must be cell barcodes
+      stopifnot(all(rownames(meta_scdblfinder) %in% colnames(seu.qc)))
+      #head(meta_scdblfinder)
+      # save metadata to add later
+      mdadd[[sname]] <- meta_scdblfinder
+      #seu.qc <- AddMetaData(object = seu.qc, metadata = meta_scdblfinder)
+      # check again the metadata
+      #table(x$scDblFinder.class)
+    }
+    
+  md_all <- dplyr::bind_rows(mdadd)
+  stopifnot(all(rownames(md_all) %in% colnames(seu.qc)))
+  seu.qc <- AddMetaData(object = seu.qc, metadata = md_all)
+  
+  # checks:
+  table(seu.qc$scDblFinder.class)
+  table(seu.qc$sample.names, seu.qc$scDblFinder.class)
+  
+  doublet_stats <- seu.qc@meta.data %>%
+    group_by(sample.names, scDblFinder.class) %>%
+    tally() %>%
+    group_by(sample.names) %>%
+    mutate(percent = n / sum(n) * 100) %>%
+    filter(scDblFinder.class == "doublet")
+  print(doublet_stats)
+  knitr::kable(table(doublet_stats))
+  output_list[["iteration"]][[iter]][["doublet_stats"]] <- doublet_stats
+  
+  
+  # Extract scores from the metadata
+  scores <- seu.qc@meta.data %>%
+    dplyr::select(sample.names, scDblFinder.score, scDblFinder.class)
+  output_list[["iteration"]][[iter]][["scores"]] <- scores
+  
+  # Plot the distribution
+  p <- ggplot(scores, aes(x = scDblFinder.score, fill = scDblFinder.class)) +
+    geom_histogram(bins = 100, alpha = 0.7, position = "identity") +
+    scale_fill_manual(values = c("doublet" = "red", "singlet" = "grey")) +
+    theme_minimal() +
+    labs(title = "Doublet Score Distribution",
+         subtitle = paste("Current Prior Rate:", dbrate),
+         x = "scDblFinder Score", y = "Cell Count") +
+    facet_wrap(~sample.names, ncol=2)
+    plot(p)
+    outfig <- file.path(Figures, paste("doublet_score_distribution_dbrate", 
+                          as.character(round(dbrate, digits=3)), ".pdf", sep=""))
+    ggsave(outfig, plot=p, width=10, height = 10) 
+  
+  # Calculate observed rate
+    calc_dbrate <- mean(doublet_stats$percent) / 100
+    ratio <- if(dbrate > 0) calc_dbrate / dbrate else 0
+    
+    
+    # log iteration history
+    iteration_history <- rbind(iteration_history, data.frame(
+    iteration = iter,
+    prior_rate = dbrate,
+    observed_rate = calc_dbrate))
+    
+    
+    if (ratio > 0.8 && ratio < 1.2){ 
+      dbrateok <- TRUE
+      print(paste("Observed rate was", round(calc_dbrate, 4), "- convergence reached."))
+    } else {
+      print(paste("Observed rate was", round(calc_dbrate, 4), "- adjusting prior."))
+      # Use a damping factor to update the rate smoothly
+      dbrate <- (dbrate + calc_dbrate) / 2
+      iter <- iter + 1
+    }
+  }
+  
+  output_list[["iteration_history"]] <- iteration_history
+  # plot how doublet detection saturated
+  plot_data <- iteration_history %>%
+    pivot_longer(cols = c(prior_rate, observed_rate), 
+                 names_to = "Metric", 
+                 values_to = "Value")
+  
+  p <- ggplot(plot_data, aes(x = iteration, y = Value, color = Metric, group = Metric)) +
+    geom_line(size = 1) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("prior_rate" = "black", "observed_rate" = "red")) +
+    theme_minimal() +
+    labs(title = "Doublet Rate Convergence Check",
+         subtitle = "Checking for saturation across iterations",
+         x = "Iteration Number",
+         y = "Doublet Rate (Decimal)") +
+    scale_x_continuous(breaks = 1:max(iteration_history$iteration))
+  
+    plot(p)
+    outfig <- file.path(Figures, "doublet_check_rate_convergence.pdf")
+    ggsave(outfig, plot=p, width=10, height=10)
+  
+  # if we are happy with doublet detection create more visualization for QC
+    
+  # Check how doublets and singlets differ in QC measures per sample.
+  p <- VlnPlot(seu.qc, group.by = 'sample.names', split.by = "scDblFinder.class",
+          features = c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent.ribo"), 
+          ncol = 2, pt.size = 0) + theme(legend.position = 'right')
+  print(p) # this is supposed to be better than plot
+  outfig <- file.path(Figures, "doublet_check_vlnplot.pdf")
+  ggsave(outfig, plot=p, width=10, height = 10)
+
+  # This part of the code is run to create QC figures only, normalization
+  # will be repeated on the final retained cells
+  plist <- list()
+  # some more metadata
+  mdadd <- list()
+  for (sname in unique(seu.qc@meta.data$sample.names)) {
+    # print(sname)
+    sobj <- subset(seu.qc, subset = sample.names==sname)
+    
+    sobj <- NormalizeData(sobj, verbose=F)
+    sobj <- FindVariableFeatures(sobj, selection.method = "vst", nfeatures = 2000, verbose=F)
+    sobj <- ScaleData(sobj, vars.to.regress = c("nCount_RNA", "percent.mito"), verbose=F)
+    # sobj <- ScaleData(sobj)
+    sobj <- RunPCA(sobj, verbose=F)
+    
+    # decide dimensions automatically
+    stdevs <- sobj[["pca"]]@stdev
+    pct <- stdevs / sum(stdevs) * 100
+    cum <- cumsum(pct)
+    co1 <- which(cum > 90)[1] # 90% of total variance explained
+    co2 <- sort(which((pct[1:(length(pct) - 1)] - pct[2:length(pct)]) > 0.1), decreasing = TRUE)[1] + 1 # Finds the last PC where the drop in variance is greater than 0.1%.
+    selected_dims <- min(co1, co2) # We take the minimum of these two to avoid including noisy, low-variance PCs.
+    if (is.na(selected_dims) || selected_dims < 10) { # fallback
+    selected_dims <- 15 }
+    # print(paste("Sample:", sname, "| Auto-selected Dims:", selected_dims))
+    
+    sobj <- FindNeighbors(object = sobj, dims = 1:selected_dims, verbose=F)
+    sobj <- FindClusters(object = sobj, verbose=F) # unnecessary here
+    sobj <- RunUMAP(object = sobj, dims = 1:1:selected_dims, verbose=F)
+    # save for later plots
+    umap_coords <- as.data.frame(Embeddings(sobj, reduction = "umap"))
+    colnames(umap_coords) <- c("UMAP_1_sample", "UMAP_2_sample")
+    
+    # visualize doublets:
+    # they often Sit between clusters, Form bridges connecting two biologically distinct clusters, 
+    # Appear as small peripheral clouds, Enrich at cluster boundaries, not cluster cores
+    p <- Seurat::DimPlot(sobj, reduction = 'umap', group.by = c("scDblFinder.class"),
+                         split.by = "seurat_clusters", ncol=3)
+    outfig <- file.path(Figures, paste("doublet_check_umap_", sname, "_clusters.pdf", sep=""))
+    ggsave(outfig, plot=p, width=10, height = 10)
+    plist[[sname]] <- Seurat::DimPlot(sobj, reduction = 'umap', group.by = c("scDblFinder.class"))
+    # outfig <- file.path(Figures, paste("doublet_check_umap_", sname, ".pdf", sep=""))
+    # ggsave(outfig, plot=p, width=10, height = 10)
+    
+    # at the same time, also calculate xxy cells
+    sex.expr <- FetchData(sobj, vars = c("XIST", "KDM5D", "RPS4Y1")) # check ambient RNA - typically 1-2 UMI
+    xxy.cells <- rownames(sex.expr)[
+      sex.expr$XIST > 1 &
+        (sex.expr$KDM5D > 1 | sex.expr$RPS4Y1 > 1)]
+    xxy_status <- ifelse(colnames(sobj) %in% xxy.cells, "XXY", "Normal")
+    names(xxy_status) <- colnames(sobj)
+    #mdadd[[sname]] <- as.data.frame(xxy_status)
+    mdadd[[sname]] <- cbind(as.data.frame(xxy_status), umap_coords)
+    
+  }
+  md_all <- dplyr::bind_rows(mdadd)
+  stopifnot(all(rownames(md_all) %in% colnames(seu.qc)))
+  seu.qc <- AddMetaData(object = seu.qc, metadata = md_all)
+  
+  # save the temporary seu object
+  SaveSeuratRds(seu.qc, file = outfile)
+  # also save output list
+  saveRDS(output_list, file=output_list_file)
+} # end of if / else wherther doublet finding has been already calculated
+  
+# plot together the remaining plots
+# real doublets sit between clusters, Form bridges connecting two biologically distinct clusters, 
+  # Appear as small peripheral clouds, Enrich at cluster boundaries, not cluster cores
+combined_plot <- patchwork::wrap_plots(plist, ncol = 4) & 
+  theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+        plot.title = element_text(hjust = 0.5, size = 10))
+for(i in seq_along(plist)) {
+  combined_plot[[i]] <- combined_plot[[i]] + ggtitle(names(plist)[i])
+}
+plot(combined_plot)
+ggsave(file.path(Figures, "doublet_check_umap_combined.pdf"), 
+       plot = combined_plot, width = 18, height = 12)
+
+
+# plot rates of cells to filter
+doublet_rates <- seu.qc@meta.data %>%
+  group_by(sample.names) %>%
+  summarise(Doublet = mean(scDblFinder.class == "doublet") * 100)
+
+# 2. Calculate the percentage of XXY cells per sample
+xxy_rates <- seu.qc@meta.data %>%
+  group_by(sample.names) %>%
+  summarise(XXY = mean(xxy_status == "XXY") * 100)
+
+# 3. Merge them and pivot to long format
+bar_data_long <- left_join(doublet_rates, xxy_rates, by = "sample.names") %>%
+  pivot_longer(
+    cols = c("Doublet", "XXY"), 
+    names_to = "Filter_Type", 
+    values_to = "Percentage"
+  )
+bar_data_long$Percentage <- round(bar_data_long$Percentage, digits = 2)
+
+p_grouped_bar <- ggplot(bar_data_long, aes(x = sample.names, y = Percentage, fill = Filter_Type)) +
+  # Draw the bars, using position_dodge for grouping
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  # Add percentage labels on top of the bars
+  geom_text(
+    aes(label = paste0(Percentage, "%")),
+    position = position_dodge(width = 0.8),
+    vjust = -0.3,
+    size = 3
+  ) +
+  # Set labels and title
+  labs(
+    title = "Doublet and XXY Percentage by Sample",
+    x = "Sample Name",
+    y = "Percentage (%)",
+    fill = "Filter Type" # Legend title
+  ) +
+  # Rotate X-axis labels for readability
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  # Set the Y-axis limits
+  scale_y_continuous(limits = c(0, max(bar_data_long$Percentage) * 1.2))
+plot(p_grouped_bar)
+ggsave(file.path(Figures, "doublet_xxy_filter.pdf"), 
+       plot = p_grouped_bar, width = 10, height = 7)
+
+```
+
+### Final Quality Assurance and Biological Feature Assessment
+
+With the final clean dataset—filtered for low-quality cells, XXY anomalies, and multiplets from kinetic confinement—we perform a final diagnostic pass to ensure the data is biologically consistent and ready for downstream analysis.
+
+* **Post-Cleaning Metrics:** We re-generate scatter and violin plots for `nCount_RNA`, `nFeature_RNA`, and organelle percentages (`percent.mito`, `percent.ribo`, `percent.globin`). These confirm that the filtering steps have successfully narrowed the population to high-confidence singlets.
+* **Sex-Linked Module Scoring:** Using `AddModuleScore`, we calculate aggregate scores for **Female-specific** ($XIST$) and **Male-specific** (Y-chromosome genes like $KDM5D$, $DDX3Y$) markers. 
+    * In this dataset, known female samples show an absence of both markers, likely due to $XIST$ inactivation or low capture of the transcript, while known male samples clearly express the male-linked module.
+* **Cell Stress Assessment:** We calculate a **Stress Score** based on a panel of immediate-early genes (e.g., $FOS$, $JUN$) and heat shock proteins. By comparing this to `percent.mito`, we can distinguish between cells that are physically damaged (high mitochondrial content) and those that are transcriptionally stressed (high Stress Score), potentially due to the dissociation or kinetic confinement process.
+
+* **Transgene Tracking ($MYCN$ & $EGFP$):** We specifically track the expression of the $MYCN$ and $EGFP$ transgenes using Dot Plots and strict count thresholds (UMI > 2). 
+    * A summary table is generated to quantify the percentage of cells positive for these markers, allowing us to evaluate the efficiency of the experimental perturbations at a single-cell level.
+
+```{r final quality check}
+# # finally, if happy with all: remove doublets and xxy cells
+# Define the cells to keep - Must be 'singlet' AND NOT 'XXY'
+cells_to_keep <- colnames(seu.qc)[seu.qc$scDblFinder.class == "singlet" & seu.qc$xxy_status != "XXY"]
+seu.clean <- subset(seu.qc, cells = cells_to_keep)
+
+# # Check the results
+# print(paste("Original cells:", ncol(seu.qc)))
+# print(paste("Cleaned cells:", ncol(seu.clean)))
+# print(paste("Cells removed:", ncol(seu.qc) - ncol(seu.clean)))
+
+# save here
+outfile <- file.path(Data_calc, "seu_clean.rds")
+SaveSeuratRds(seu.clean, file=outfile)
+  
+p <- Seurat::FeatureScatter(seu.clean, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",
+                            group.by = "sample.names", split.by="sample.names", 
+                            ncol=4, plot.cor = F)+
+                       ggplot2::theme(legend.position = "none")
+plot(p)
+outfig <- file.path(Figures, "nCount_vs_nFeature_clean.pdf")
+ggsave(outfig, plot=p, height=12, width=15, units="in")
+
+p <- Seurat::VlnPlot(seu.clean, features = c("nCount_RNA",  "nFeature_RNA"),
+                     group.by = "sample.names") 
+plot(p)
+outfig <- file.path(Figures, "violinplot_nCount_nFeature_clean.pdf")
+ggsave(outfig, plot=p, width=10, height=6.4, units="in")
+
+p <- Seurat::VlnPlot(seu.clean, features = c("percent.mito",
+                                       "percent.ribo",
+                                       "percent.globin"),
+                     group.by = "sample.names", ncol=3)
+plot(p)
+ggsave(file.path(Figures, "Violin_mito_ribo_globin_clean.pdf"), 
+       height=10, width=15)
+
+# plot "sex genes"
+# female_genes <- list(c("XIST"))
+# male_genes <- list(c("KDM5D", "RPS4Y1")) # Add other Y genes if present
+# Female: XIST (Specific) + X-linked escapees (Enriched)
+female_genes <- list(c(
+  "XIST"
+  #"XIST", "KDM6A", "DDX3X", "EIF1AX", "USP9X", "ZRSR2", "JPX", "FTX", "XACT"
+))
+
+# Male: Y-linked genes (Strictly Male-specific)
+male_genes <- list(c(
+  "KDM5D", "RPS4Y1", "DDX3Y", "USP9Y", "EIF1AY", "UTY", "TMSB4Y", "ZFY", "NLGN4Y"
+))
+
+# # raw results
+# seu.clean[["percent_XIST"]] <- PercentageFeatureSet(seu.clean, features = "XIST")
+# seu.clean[["percent_Y"]] <- PercentageFeatureSet(seu.clean, 
+#                                                  features = c("KDM5D", "RPS4Y1", "DDX3Y", "USP9Y"))
+# FeatureScatter(seu.clean, feature1 = "percent_XIST", feature2 = "percent_Y", group.by = "sample.names")
+# VlnPlot(seu.clean, features = "XIST", group.by = "sample.names")
+
+# Calculate scores
+seu.clean <- NormalizeData(seu.clean)
+seu.clean <- AddModuleScore(seu.clean, features = female_genes, name = "FemaleScore")
+seu.clean <- AddModuleScore(seu.clean, features = male_genes, name = "MaleScore")
+
+# Plot the scores against each other
+#FeatureScatter(seu.clean, feature1 = "FemaleScore1", feature2 = "MaleScore1", group.by = "sample.names")
+p <- Seurat::VlnPlot(seu.clean, features = c("FemaleScore1", "MaleScore1"),
+                     group.by = "sample.names") +
+  ggplot2::theme(legend.position = "none")
+plot(p)
+ggsave(file.path(Figures, "violinplot_sex_socres.pdf"),
+  plot = p, width = 10, height = 10, units = "in")
+
+# plot stressed cells
+stress.genes <- c("FOS", "JUN", "ATF3", "DDIT3", "HSPA1A", "HSPA1B",
+                  "DNAJB1", "IER2", "BTG2", "GADD45A")
+seu.clean <- AddModuleScore(
+  seu.clean,
+  features = list(stress.genes),
+  name = "StressScore")
+p <- VlnPlot(seu.clean, features = c("percent.mito", "StressScore1")) # "StressScore1" - autmatically appended a number
+plot(p)
+outfig <- file.path(Figures, "violinplot_mito_stress_RNA.pdf")
+ggsave(outfig, plot=p, width=10, height=7)
+
+
+# calculate MYCN and EGFP
+# dot plot
+Idents(seu.clean) <- "sample.names"
+
+p <- DotPlot(
+  seu.clean,
+  features = c("MYCN", "EGFP"),
+  assay = "RNA"
+) + ggplot2::theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot(p)
+ggsave(
+  file.path(Figures, "dotplot_clean_MYCN_EGFP.pdf"),
+  plot = p, width = 8, height = 5, units = "in"
+)
+
+# Percentage of cells with ≥1 MYCN UMI
+DefaultAssay(seu.clean) <- "RNA"
+rna_data <- FetchData(
+  seu.clean,
+  vars = c("MYCN", "EGFP", "sample.names"),
+  layer = "counts"
+)
+rna_data <- rna_data %>%
+  dplyr::mutate(
+    MYCN_detected = MYCN > 2,
+    EGFP_detected = EGFP > 2
+  )
+cell_counts_table <- rna_data %>%
+  dplyr::group_by(sample.names) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    n_MYCN = sum(MYCN_detected),
+    n_EGFP = sum(EGFP_detected),
+    n_both = sum(MYCN_detected & EGFP_detected),
+    percent_MYCN = 100 * n_MYCN / n_cells,
+    percent_EGFP = 100 * n_EGFP / n_cells,
+    percent_both = 100 * n_both / n_cells
+  )
+
+print(cell_counts_table) # print out nicely for knitted html
+```
+
+
+### Cell Cycle Phase Assignment and Proliferation Analysis
+
+This analysis step identifies the proliferative state of each cell by scoring the expression of well-characterized gene sets associated with the **S (Synthesis)** and **G2/M (Mitosis)** phases.
+
+* **Sample-Specific Scoring:** To ensure accuracy, the dataset is temporarily split by sample to perform individual normalization. We apply `CellCycleScoring` using the updated 2019 gene sets, which assigns:
+    * **S.Score:** Expression levels of genes involved in DNA replication.
+    * **G2M.Score:** Expression levels of genes involved in the preparation for and execution of mitosis.
+    * **Phase:** A categorical assignment (G1, S, or G2M) based on which score is dominant.
+* **Cell Cycle Variation (`ccvar`):** We calculate a custom variable representing the difference between the S and G2M scores. This is often used later in the pipeline to regress out cell cycle effects if the goal is to cluster cells by lineage rather than by their current position in the division cycle.
+* **Phase Distribution Visualization:** * **Proportional Barplots:** We visualize the fraction of cells in G1, S, and G2M per sample. This is particularly informative for organoid studies to see if specific experimental conditions or genotypes lead to increased proliferation or cell cycle arrest.
+    * **Score Scatter Plots:** By plotting S.Score against G2M.Score, we validate the classification. Cells should transition from G1 (low/low) into S (high S) and then into G2/M (high G2M), forming a characteristic "arc" that reflects the biological progression of the cell cycle.
+
+The final `seu_final.rds` object now contains these proliferative metrics, which will allow us to decide whether to regress out these "nuisance" variables during final dimensionality reduction.
+```{r cell cycle scoring}
+# cell cycle scoring
+cc.genes <- Seurat::cc.genes.updated.2019
+s.genes  <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+cc_metadata_list <- list()
+plist <- list()
+for (sname in unique(seu.clean@meta.data$sample.names)) {
+  #print(sname)
+  sobj <- subset(seu.clean, subset = sample.names==sname)
+  # Now do the normalization, etc on the single samples again
+  sobj <- NormalizeData(sobj) # corrects for differences in sequencing depth
+  sobj <- FindVariableFeatures(sobj, selection.method = "vst", nfeatures = 2000)
+  sobj <- CellCycleScoring(
+    object = sobj,
+    s.features = s.genes,
+    g2m.features = g2m.genes,
+    set.ident = FALSE
+  )
+  sobj@meta.data[, "ccvar"]=  sobj@meta.data[, "S.Score"] - sobj@meta.data[, "G2M.Score"]
+  cc_metadata_list[[sname]] <- sobj@meta.data[, c("S.Score", "G2M.Score", "Phase", "ccvar")]
+  
+  # We only need to scale the cell cycle genes to save time for this specific plot
+  sobj <- ScaleData(sobj, features = c(s.genes, g2m.genes))
+  # plot the arc
+  sobj <- RunPCA(sobj, features = c(s.genes, g2m.genes))
+  plist[[sname]] <- DimPlot(sobj, group.by="Phase")
+}
+
+# plot the characteristic arc
+combined_plot <- patchwork::wrap_plots(plist, ncol = 4)
+plot(combined_plot)
+ggsave(file.path(Figures, "cell_cycle_phases_arc_combined.pdf"), 
+       plot = combined_plot, width = 18, height = 12)
+
+cc_metadata_all <- do.call(rbind, cc_metadata_list)
+seu.clean <- AddMetaData(seu.clean, metadata = cc_metadata_all)
+
+
+# save here
+outfile <- file.path(Data_calc, "seu_final.rds")
+SaveSeuratRds(seu.clean, file=outfile)
+
+# visualizing
+# 1. Barplot of Phases per Sample
+p <- ggplot(seu.clean@meta.data, aes(x = sample.names, fill = Phase)) +
+  geom_bar(position = "fill") +
+  theme_minimal() +
+  labs(title = "Cell Cycle Phase Distribution", y = "Proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot(p)
+outfig <- file.path(Figures, "cell_cycle_phases.pdf")
+ggsave(outfig, plot=p, height=10, width=10, units="in")
+
+# # 2. Scatter plot of scores
+# p <- FeatureScatter(seu.clean, feature1 = "S.Score", feature2 = "G2M.Score", group.by = "Phase")
+# plot(p)
+# outfig <- file.path(Figures, "cell_cycle_scatter.pdf")
+# ggsave(outfig, plot=p, height=10, width=10, units="in")
+
+```
