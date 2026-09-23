@@ -1,0 +1,308 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 3 - selected resolutions"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the organoid single cell RNA sequencing.
+
+```{r libraries}
+
+packages <- c(
+  "Seurat",
+  "ggplot2",
+  "patchwork",    
+  "Matrix",
+  "dplyr",
+  "here",
+  "stringr",      
+  "future",       
+  "clustree",     
+  "RColorBrewer",
+  "ggforce",
+  "concaveman",
+  "openxlsx",
+  "viridis",      
+  "msigdbr"   
+)
+invisible(lapply(packages, library, character.only = TRUE))
+
+```
+
+
+<!-- # Biztosan kellene sejt -->
+<!-- # populáció/cluster azonosítás marker gének alapján, pseudotime analízis -->
+<!-- # és CellChat vagy CellPhoneDB analízis is -> do CellChat: https://github.com/jinworks/CellChat1 -->
+
+Folder structure is defined first
+```{r}
+Datafolder     <- here("Data")
+# Subdirectories specifically isolated for this run's outputs
+Figures   <- here(file.path("Figures", "selected_resolution"))
+Figures_dimplots <- file.path(Figures, "dimplots")
+Data_calc <- here("Data_calculated")
+Results   <- here("Results")
+
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Figures_dimplots))   dir.create(Figures_dimplots, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+
+utils_file <- here("Rscripts","utils.R")
+if (file.exists(utils_file)) source(utils_file)
+```
+
+
+Config parameters and marker lists
+```{r}
+config_file <- here("Rscripts","config.R")
+source(config_file)
+```
+
+# First, create MYCN - EGFP dotplot
+
+```{r MYCN - EGFP dotplot}
+
+outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", "EpiC", "_all_nHVG", nHVG_str, ".rds", sep=""))
+seu.integrated_EpiC <- LoadSeuratRds(outfile)
+outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", "kolf2", "_all_nHVG", nHVG_str, ".rds", sep=""))
+seu.integrated_kolf2 <- LoadSeuratRds(outfile)
+
+# Extract DotPlot data from each object
+p1_data <- DotPlot(seu.integrated_EpiC, features = c("MYCN", "EGFP"), group.by = "sample.names", assay = "RNA")$data
+p1_data <- p1_data[p1_data$pct.exp > 0, ] # remove zero percent dots!
+p2_data <- DotPlot(seu.integrated_kolf2, features = c("MYCN", "EGFP"), group.by = "sample.names", assay = "RNA")$data
+p2_data <- p2_data[p2_data$pct.exp > 0, ] # remove zero percent dots!
+
+nice_sample_order <- unname(sample_names_dict)
+
+# Combine, rename, filter, and scale
+df_combined <- rbind(p1_data, p2_data) %>%
+  mutate(
+    # Recode raw sample IDs to nice names
+    id = dplyr::recode(as.character(id), !!!sample_names_dict)
+  ) %>%
+  # Filter background noise
+  filter(pct.exp > 2) %>%
+  mutate(
+    # Lock factor levels to dictionary order, reversed (so item 1 is at the top)
+    id = factor(id, levels = rev(nice_sample_order))
+  ) %>%
+  # Calculate scaled expression per feature across all remaining samples
+  group_by(features.plot) %>%
+  mutate(avg.exp.scaled = as.vector(scale(avg.exp))) %>%
+  ungroup()
+
+# Plot manually with ggplot2
+p <- ggplot(df_combined, aes(x = features.plot, y = id, size = pct.exp, color = avg.exp.scaled)) +
+  geom_point() +
+  scale_color_gradient(low = "lightgrey", high = "red") +
+  scale_size_area(max_size = 6) +
+  # Prevents empty samples from being removed from the Y-axis tick labels
+  scale_y_discrete(drop = FALSE) +
+  theme_bw() +
+  RotatedAxis() +
+  labs(x = NULL, y = NULL, size = "Percent Expressed", color = "Average Expression")
+
+# Display and save 
+ggsave(file.path(Figures, "MYCN_EGFP_dotplot.pdf"), p, width = 6, height = 6)
+
+
+# also a nice dimplot is needed
+
+egfp_epic <- FetchData(seu.integrated_EpiC, vars = "EGFP")[, 1]
+egfp_kolf <- FetchData(seu.integrated_kolf2, vars = "EGFP")[, 1]
+
+objects_list <- list(
+  "EpiC" = seu.integrated_EpiC,
+  "kolf2" = seu.integrated_kolf2
+)
+
+for (ct in names(objects_list)) {
+  seu_obj <- objects_list[[ct]]
+  
+  p_list <- FeaturePlot(seu_obj, features = c("EGFP"), combine = FALSE, split.by = "sample.names")
+  p_list_notitles <- lapply(p_list, function(p) {
+    p +
+      scale_y_continuous(sec.axis = waiver())
+  })
+  print(p_list_notitles)
+  p_list_colored <- lapply(p_list_notitles, function(p) {
+    p +
+      scale_colour_gradient(
+        low = "lightgrey",
+        high = "purple",
+        limits = c(min_val, max_val),
+        oob = scales::squish
+      )
+  })
+  p_list_clean <- lapply(p_list_colored, add_corner_axes)
+  for (pi in 1:length(p_list_clean)){
+    pname <- unique(seu_obj$sample.names)[pi]
+    pf <- p_list_clean[[pi]]
+    # save each
+    selres <- selres_list[[ct]]
+      ggsave(file.path(Figures_dimplots, paste("EGFP_dimplot_", ct, "_selres_", selres,
+                                "_all_nHVG", nHVG_str, "_", pname, ".pdf", sep="")), 
+       pf, width = 4, height = 4) 
+  }
+
+  p_combined <- wrap_plots(p_list_clean, ncol = 2)
+  ggsave(
+    file.path(Figures, paste0("EGFP_DimPlot_split_", ct, "_all_nHVG", nHVG_str, ".pdf")),
+    p_combined, width = 8, height = 8
+  )
+  
+  # repeat without split
+  p_list <- FeaturePlot(seu_obj, features = c("EGFP"), combine = FALSE)
+  p_list_clean <- lapply(p_list, add_corner_axes)
+  for (pi in 1:length(p_list_clean)){
+    pname <- names(p_list)[pi]
+    pf <- p_list_clean[[pi]] + scale_colour_gradient(
+          low = "lightgrey",
+          high = "purple",
+          limits = c(min_val, max_val),
+          oob = scales::squish
+        )
+  }  
+  ggsave(
+      file.path(Figures, paste0("EGFP_DimPlot_nosplit_", ct, "_all_nHVG", nHVG_str, ".pdf")),
+      p_list_clean[[1]], width = 4, height = 4
+  )
+}
+
+
+
+
+# delete large Seurat objects
+rm(seu.integrated_EpiC, seu.integrated_kolf2)
+gc()
+```
+
+
+
+Normalised data for each cell type is imported.
+```{r EpiC}
+
+for (ct in c("EpiC", "kolf2")){
+  #integratedfile <- file.path(Data_calc, paste("seu_integrated_", ct, "_D26.rds", sep="")) 
+  outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+  seu.integrated <- LoadSeuratRds(outfile)
+  # write out cell numbers
+  table(seu.integrated$sample.names)
+  # use nice sample names as well:
+  seu.integrated$sample_names_renamed <- dplyr::recode(
+    as.character(seu.integrated$sample.names),
+    !!!sample_names_dict )
+  seu.integrated$sample_names_renamed <- factor(seu.integrated$sample_names_renamed, levels = unique(seu.integrated$sample_names_renamed))
+
+  
+  # add van-Haver markers
+       # Van-Haver markers - ensure genes are present
+  marker_list_filtered <- lapply(marker_list, function(genes) {
+      genes[genes %in% rownames(seu.integrated)]
+    })
+    
+  # subtracting the average expression of "control genes" from the feature genes
+  seu.integrated <- AddModuleScore(
+      seu.integrated,
+      features = marker_list_filtered,
+      name     = names(marker_list_filtered),
+      nbin     = 10
+    )
+  
+    # needs to be done for the marker names
+  # copied from the anal2_manuscript...
+  new_cols <- grep(paste0("(", paste(names(marker_list_filtered), collapse="|"), ")\\d+"), 
+               colnames(seu.integrated@meta.data), value = TRUE)
+  marker_names <- gsub("\\d+$", "", new_cols)
+  names(marker_names) <- new_cols
+  colnames(seu.integrated@meta.data)[colnames(seu.integrated@meta.data) %in% new_cols] <- (
+    marker_names[match(colnames(seu.integrated@meta.data)[colnames(seu.integrated@meta.data) %in% new_cols], names(marker_names))])
+
+  # select selected selres
+  selres <- selres_list[[ct]]
+  #seu.integrated@meta.data$seurat_clusters <- seu.integrated@meta.data[[selres]]
+  Idents(seu.integrated) <- selres
+  #print(table(Idents(seu.integrated)))
+  
+  # rewrite names 
+  new.cluster.ids <- new.cluster.ids.list[[ct]]
+  seu.integrated <- SeuratObject::RenameIdents(seu.integrated, new.cluster.ids)
+  seu.integrated$cluster_type <- Idents(seu.integrated)
+  
+  # remove "stray" cells
+  cell_counts <- table(seu.integrated$sample.names, seu.integrated$cluster_type)
+  counts_df <- as.data.frame(cell_counts)
+  colnames(counts_df) <- c("sample.names", "cluster_type", "Freq")
+  keep_combinations <- counts_df[counts_df$Freq >= 10, ] # # 3. Identify the combinations that actually have 10 (15) or more cells
+  valid_pairs <- paste(keep_combinations$sample.names, keep_combinations$cluster_type, sep = "_")
+  cell_pairs <- paste(seu.integrated$sample.names, seu.integrated$cluster_type, sep = "_")
+  
+  # Subset the Seurat object to keep only cells in those valid pairs
+  seu.integrated <- subset(seu.integrated, cells = which(cell_pairs %in% valid_pairs))
+  table(seu.integrated$sample.names, seu.integrated$cluster_type)
+  
+  # set up the order
+  bio_order <- bio_order_list[[ct]]
+  seu.integrated$cluster_type <- factor(
+    as.character(seu.integrated$cluster_type), 
+    levels = bio_order
+  )
+  
+  # remove levels not populated
+  seu.integrated$cluster_type <- droplevels(seu.integrated$cluster_type)
+  
+  # save object with final cluster types
+  outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+  SaveSeuratRds(seu.integrated, file=outfile)
+  
+    
+}
+  
+```
+
+
+Temporary for GEO upload - merge the two integrated seurat objects
+```{r for GEO upload}
+GEO_file <- "exists"
+
+if (!GEO_file == "exists"){
+  outfile1 <- file.path(Results, paste("seu_integrated_clusters_newnames_", "EpiC", "_all_nHVG", nHVG_str, ".rds", sep=""))
+  seu.integrated1 <-  LoadSeuratRds(file=outfile1)
+  outfile2 <- file.path(Results, paste("seu_integrated_clusters_newnames_", "kolf2", "_all_nHVG", nHVG_str, ".rds", sep=""))
+  seu.integrated2 <-  LoadSeuratRds(file=outfile2)
+  # merge
+  seu.all <- merge(x = seu.integrated1 , 
+               y = seu.integrated2)
+  seu.all$cell_type <- stringr::str_split_i(Cells(seu.all), "_", 2)
+  
+  cols <- names(seu.all@meta.data)
+  new_order <- c(cols[1], "cell_type", setdiff(cols[-1], "cell_type"))
+  # seu.all@meta.data <- seu.all@meta.data[, new_order]
+  seu.all@meta.data <- seu.all[[new_order]]
+  
+  # save
+  outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", "both_cells", "_all_nHVG", nHVG_str, ".rds", sep=""))
+  SaveSeuratRds(seu.all, file=outfile)
+}
+
+
+```

@@ -1,0 +1,511 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 7 - obtain signaling pathways routes between clusters"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+editor_options: 
+  chunk_output_type: inline
+---
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the single cell RNA sequencing.
+
+```{r libraries}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+packages <- c(
+  "Seurat",
+  "ggplot2",
+  "patchwork", # to combine plots
+  "dplyr",
+  "here",
+  # for concave hulls:
+  "ggforce",
+  "openxlsx",
+  "future",    # in this case to stop parallelization
+  "CellChat",
+   "gridExtra",
+   "grid", 
+   "patchwork"
+)
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+
+Folder structure
+```{r}
+Datafolder     <- here("Data")
+Data_public <- here("Data_public")
+Data_calc <- here("Data_calculated") # Path to find Part 1 and 2 outputs
+
+# Subdirectories specifically isolated for this run's outputs
+Figures   <- here(file.path("Figures", "cell_chat_other"))
+Data_calc <- here("Data_calculated")
+Results   <- here("Results")
+
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+
+utils_file <- here("Rscripts","utils.R")
+if (file.exists(utils_file)) source(utils_file)
+```
+
+Config parameters and marker lists
+```{r}
+config_file <- here("Rscripts","config.R")
+source(config_file)
+```
+
+
+Read in reference data that will be used
+```{r}
+
+# for checks:
+FGF_genes <- list(
+"ligands" = c(
+  # FGF Ligands
+  "FGF1", "FGF2", "FGF3", "FGF4", "FGF5", "FGF6", "FGF7", "FGF8", "FGF9", 
+  "FGF10", "FGF11", "FGF12", "FGF13", "FGF14", "FGF16", "FGF17", "FGF18", 
+  "FGF19", "FGF20", "FGF21", "FGF22", "FGF23"),
+"receptors"= c(
+  # FGF Receptors
+  "FGFR1", "FGFR2", "FGFR3", "FGFR4"
+))
+
+EGF_genes <- list(
+"ligands" = c(
+  # EGF Ligands
+  "EGF", "HBEGF", "TGFA", "EREG", "BTC", "AREG", "EPGN", "NRG1", "NRG2", 
+  "NRG3", "NRG4"
+),
+"receptors" = c(
+  # EGF Receptors
+  "EGFR", "ERBB2", "ERBB3", "ERBB4"
+))
+
+
+# now the input data; ref_info is loaded from config.R, but only use specific data
+    
+  ref_names <- names(ref_info)
+  ref_names <- ref_names[ref_names %in% c("Jansky", "GOSH", "PMC")]
+  
+  refs <- lapply(ref_names, function(ref_name){
+  
+    message("Loading ", ref_name)
+  
+    obj <- readRDS(file.path(Data_public, ref_info[[ref_name]]$path))
+    obj <- UpdateSeuratObject(obj)
+  
+    obj$reference_source <- ref_name
+  
+    obj
+  })
+  
+  names(refs) <- ref_names 
+  
+  # list possibilities
+  for (ri in 1:length(refs)){
+    print(ref_names[ri])
+    print(unique(refs[[ri]]@meta.data[[ref_info[[ri]]$label_col]]))
+    print("")
+  }
+  
+
+  # recode references
+  refs[["Jansky"]]$celltype_harmonized <- recode_labels(
+    refs[["Jansky"]]$celltype,
+    c(
+      "Tumor cells" = "tumor",
+      "Immune cells" = "other",
+      "Mesenchymal cells" = "mesenchymal",
+      "Endothelial cells" = "endothelial",
+      "Schwann cells" = "SCP",
+      "Liver cells" = "other"
+    )
+  )
+  
+  refs[["GOSH"]]$celltype_harmonized <- recode_labels(
+    refs[["GOSH"]]$Annotation,
+    c(
+      "Tumour cluster 1" = "tumor",
+      "Tumour cluster 2" = "tumor",
+      "Tumour cluster 3" = "tumor",
+      "Leukocytes" = "other",
+      "Mesenchyme" = "mesenchymal",
+      "Endothelium" = "endothelial"
+    )
+  )    
+      
+  refs[["PMC"]]$celltype_harmonized <- recode_labels(
+    refs[["PMC"]]$Annotation,
+    c(
+      "Tumour cluster 1" = "tumor",
+      "Tumour cluster 2" = "tumor",
+      "Tumour cluster 3" = "tumor",
+       "Schwannian stroma" = "SCP",
+      "Mesenchyme" = "mesenchymal",
+      "Leukocytes" = "other",
+      "Endothelium" = "endothelial",
+      "Ambiguous 1" = "other",
+      "Ambiguous 2" = "other"
+    )
+  )
+  
+
+  # sanity check:
+  lapply(refs, function(x) {
+    sort(table(x$celltype_harmonized), decreasing = TRUE)
+  })
+  
+  # check how much gets lost
+  lapply(refs, function(x) {
+    mean(x$celltype_harmonized == "unknown")
+  })
+  
+  # downsample huge populations 
+  for(i in seq_along(refs)){
+
+    Idents(refs[[i]]) <- "celltype_harmonized"
+
+    print(table(refs[[i]]$celltype_harmonized))
+    refs[[i]] <- subset(
+      refs[[i]],
+      downsample = 2000
+    )
+    # after downsaampling
+    print("after downsampling:")
+    print(table(refs[[i]]$celltype_harmonized))
+    print("===")
+  }
+  
+  # remomve "other" cells
+  for (rname in names(refs)){
+   # there are a huge number of uknown -> remove
+   refs[[rname]] <- subset(refs[[rname]], subset = !celltype_harmonized %in% c("other"))
+  }
+  
+  # save with harmonised
+  for (ref_name in names(refs)) {
+    
+    # create harmonized annotation
+    file_harmonized <- file.path(Data_calc,
+              paste0("ref_", ref_name, "_harmonized_transformed_down2000.rds"))
+    
+    if (!file.exists(file_harmonized)){
+      ref_obj <- refs[[ref_name]]
+      ref_obj <- SCTransform(ref_obj, vst.flavor = "v2")
+      ref_obj <- RunPCA(ref_obj)
+      ref_obj <- RunUMAP(ref_obj, dims = 1:30,
+          reduction = "pca", return.model = TRUE)
+  
+      SaveSeuratRds(ref_obj, file=file_harmonized)
+    }
+  }
+  
+
+  
+  # now the CellChat part
+  
+  ref_objects <- list()
+  for (ref_name in names(refs)){
+    message(paste("--- Processing Reference:", ref_name, "---"))
+    ref_file <-  file.path(Data_calc, 
+                      paste0("ref_", ref_name, "_harmonized_transformed_down2000.rds"))
+    if (file.exists(ref_file)){
+      ref_obj <- LoadSeuratRds(file=ref_file)
+    } else {
+      stop("Reference file does not exist: ", ref_file)
+    }
+      
+      DefaultAssay(ref_obj) <- "RNA"
+      Idents(ref_obj) <- "celltype_harmonized"
+
+    p_dot <- DotPlot(
+      ref_obj,
+      features = EGF_genes, 
+      cols = c("lightgrey", "red"),
+      col.min = 0,
+      dot.scale = 6,
+      assay = "RNA"
+    ) +
+    theme_bw() +
+    RotatedAxis() + 
+    theme(
+      axis.text.x = element_text(size = 12),
+      axis.title.x = element_blank(), 
+      axis.title.y = element_blank(), 
+      strip.clip = "off"
+    ) 
+    p_dot$data <- p_dot$data[p_dot$data$pct.exp > 0, ] # remove zero percent dots!
+    ggsave(file.path(Figures, paste("EGF_dotplot_", ref_name, ".pdf", sep="")), 
+           p_dot, width = 10, height = 6)
+    
+    p_dot <- DotPlot(
+      ref_obj,
+      features = FGF_genes, 
+      cols = c("lightgrey", "red"),
+      col.min = 0,
+      dot.scale = 6,
+      assay = "RNA"
+    ) +
+    theme_bw() +
+    RotatedAxis() + 
+    theme(
+      axis.text.x = element_text(size = 12),
+      axis.title.x = element_blank(), 
+      axis.title.y = element_blank(), 
+      strip.clip = "off"
+    ) 
+    p_dot$data <- p_dot$data[p_dot$data$pct.exp > 0, ] # remove zero percent dots!
+    ggsave(file.path(Figures, paste("FGF_dotplot_", ref_name, ".pdf", sep="")), 
+           p_dot, width = 10, height = 6)
+    
+    
+    # create cellchat object - now sample column
+    if (ref_name=="Jansky") ref_obj$samples <- ref_obj$patientID
+    if (ref_name=="GOSH") ref_obj$samples <- ref_obj$SampleName
+    if (ref_name=="PMC") ref_obj$samples <- ref_obj$SampleName
+    
+    cellchat <- createCellChat(object = ref_obj, 
+                      group.by = "celltype_harmonized", assay = "RNA")
+    groupSize <- as.numeric(table(cellchat@idents)) # number of cells in each cell group
+    
+    # read in database
+    CellChatDB <- CellChatDB.human # use CellChatDB.mouse if running on mouse data
+    showDatabaseCategory(CellChatDB)
+    
+    # use a subset of CellChatDB for cell-cell communication analysis -may be other subset!!!
+    CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling 
+    cellchat@DB <- CellChatDB.use
+    
+    # preprocess expression data
+    # subset the expression data of signaling genes for saving computation cost
+    cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+    ptm = Sys.time()
+    future::plan("multisession", workers = max(1, parallel::detectCores() - 1)) # do parallel
+    cellchat <- identifyOverExpressedGenes(cellchat)
+    cellchat <- identifyOverExpressedInteractions(cellchat)
+    #> The number of highly variable ligand-receptor pairs used for signaling inference is 811 # day42_hTh EpiC
+    execution.time = Sys.time() - ptm
+    print(as.numeric(execution.time, units = "secs"))
+    #> [1] 13.20763
+    # project gene expression data onto PPI (Optional: when running it, USER should set `raw.use = FALSE` in the function `computeCommunProb()` in order to use the projected data)
+    # cellchat <- projectData(cellchat, PPI.human)
+    
+    # Compute the communication probability and infer cellular communication network
+    # # if it still takes too long, downsample earlier:
+    # ref_obj <- subset(ref_obj, downsample = 1000)
+    
+    future::plan(multicore, workers = max(1, parallel::detectCores() - 1))   # Linux only
+    options(future.globals.maxSize = 20 * 1024^3)
+    ptm = Sys.time()
+    # cellchat <- computeCommunProb(cellchat, type = "triMean")
+    # try less stringent threshold
+    cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.1)
+    execution.time = Sys.time() - ptm
+    print(as.numeric(execution.time, units = "secs"))
+    future::plan(future::sequential) # reset
+    
+    
+    # use filter
+    cellchat <- filterCommunication(cellchat, min.cells = 10)
+    
+    # # ligand/receptor communication
+    df.net <- subsetCommunication(cellchat)
+    df.net.EGF <- df.net[which(df.net$pathway_name=="EGF"),]
+    # # signalling pathways communication
+    # df.net <- subsetCommunication(cellchat, slot.name = "netP")
+    
+    # Infer the cell-cell communication at a signaling pathway level
+    cellchat <- computeCommunProbPathway(cellchat)
+    
+    # Calculate the aggregated cell-cell communication network
+    ptm = Sys.time()
+    cellchat <- aggregateNet(cellchat)
+    execution.time = Sys.time() - ptm
+    print(as.numeric(execution.time, units = "secs"))
+    
+    # visualize
+    
+    # number/strength of interactions
+    groupSize <- as.numeric(table(cellchat@idents))
+    file_name_net <- paste("netvisual_count_", ref_name, "_interaction_overview", ".pdf", sep="")
+    full_path_net <- file.path(Figures, file_name_net)
+    pdf(file = full_path_net, width = 6, height = 6) # Width 12 because of mfrow=c(1,2)
+    par(mfrow = c(1,1), xpd=TRUE)
+    netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+    dev.off()
+    
+    file_name_net <- paste("netvisual_weight_", ref_name, "_interaction_overview", ".pdf", sep="")
+    full_path_net <- file.path(Figures, file_name_net)
+    pdf(file = full_path_net, width = 6, height = 6) # Width 12 because of mfrow=c(1,2)
+    par(mfrow = c(1,1), xpd=TRUE)
+    netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+    dev.off()
+    
+    
+    ptm = Sys.time()
+    # Compute the network centrality scores
+    cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+    # the slot 'netP' means the inferred intercellular communication network of signaling pathways
+    execution.time = Sys.time() - ptm
+    print(as.numeric(execution.time, units = "secs"))
+    
+    # save all signalling pathways present
+    
+    # Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+    ht1 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", width = 8, height = 12)
+    ht2 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", width = 8, height = 12)
+    
+    file_name_ht <- paste("netvisual_", ref_name, "_signalingRole_heatmap", ".pdf", sep="")
+    full_path_ht <- file.path(Figures, file_name_ht)
+    
+    pdf(file = full_path_ht, width = 9, height = 7)
+    # Use draw() with tight manual padding (Bottom, Left, Top, Right)
+    ComplexHeatmap::draw(ht1 + ht2, ht_gap = unit(2, "mm"), padding = unit(c(2, 5, 2, 5), "mm"))
+    dev.off()
+    
+    # separately
+    pathways.show.all <- cellchat@netP$pathways
+    for (pw in pathways.show.all) {
+      pathways.show <- pw
+      
+      file_name_role <- paste("netvisual_", ref_name, "_", pathways.show, ".pdf", sep="")
+      full_path_role <- file.path(Figures, file_name_role)
+      
+      # Open device using the widths/heights specified in your original function call
+      pdf(file = full_path_role, width = 4.5, height = 3)
+      netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 4.5, height = 3, font.size = 10)
+      dev.off()
+    }
+    
+    # save pathways for comparison
+    if (ref_name=="GOSH"){
+      pathways_GOSH   <- cellchat@netP$pathways
+      saveRDS(pathways_GOSH, file=file.path(Data_calc, "pathways_GOSH.rds"))
+    }
+    if (ref_name=="PMC"){
+      pathways_PMC   <- cellchat@netP$pathways
+      saveRDS(pathways_PMC, file=file.path(Data_calc, "pathways_PMC.rds"))
+    }
+    if (ref_name=="Jansky"){
+      pathways_Jansky   <- cellchat@netP$pathways
+      saveRDS(pathways_Jansky, file=file.path(Data_calc, "pathways_Jansky.rds"))
+    }
+  }
+  
+  
+```
+
+
+Compare CellChat results
+```{r}
+# Each of these should be the character vector of active pathways
+# (cellchat@netP$pathways) from the corresponding CellChat run
+pathways_H1     <- readRDS(file=file.path(Data_calc, "pathways_H1.rds"))
+pathways_H2     <- readRDS(file=file.path(Data_calc, "pathways_H2.rds"))
+pathways_GOSH   <- readRDS(file=file.path(Data_calc, "pathways_GOSH.rds"))
+pathways_PMC    <- readRDS(file=file.path(Data_calc, "pathways_PMC.rds"))
+pathways_Jansky <- readRDS(file=file.path(Data_calc, "pathways_Jansky.rds"))
+
+# Pre-intersect as described in the legend
+hNBO_pathways   <- intersect(pathways_H1, pathways_H2)
+primary_pathways <- intersect(pathways_GOSH, pathways_PMC)
+
+get_venn_regions <- function(sets) {
+  list(
+    "A: hNBOs only"        = setdiff(sets[[1]], union(sets[[2]], sets[[3]])),
+    "B: GOSH∩PMC only"     = setdiff(sets[[2]], union(sets[[1]], sets[[3]])),
+    "C: Jansky only"       = setdiff(sets[[3]], union(sets[[1]], sets[[2]])),
+    "D: hNBOs & GOSH∩PMC"  = setdiff(intersect(sets[[1]], sets[[2]]), sets[[3]]),
+    "E: hNBOs & Jansky"    = setdiff(intersect(sets[[1]], sets[[3]]), sets[[2]]),
+    "F: GOSH∩PMC & Jansky" = setdiff(intersect(sets[[2]], sets[[3]]), sets[[1]]),
+    "G: all three"         = Reduce(intersect, sets)
+  )
+}
+
+venn_list <- list(
+  "hNBOs (H1 ∩ H2)" = hNBO_pathways,
+  "GOSH ∩ PMC"      = primary_pathways,
+  "Jansky"          = pathways_Jansky
+)
+
+regions <- get_venn_regions(venn_list)
+
+
+circle_df <- data.frame(
+  set  = c("hNBOs (H1 ∩ H2)", "GOSH ∩ PMC", "Jansky"),
+  x0   = c(0, 0.866, -0.866),
+  y0   = c(1, -0.5, -0.5),
+  r    = 1.5,
+  fill = c("blue", "brown", "green")
+)
+
+title_pos <- data.frame(
+  label = circle_df$set,
+  x = c(0, 2.3, -2.3),
+  y = c(2.9, -1.9, -1.9)
+)
+
+label_pos <- data.frame(
+  region = names(regions),
+  letter = LETTERS[1:7],
+  x = c(0, 1.5, -1.5, 0.8, -0.8, 0, 0),
+  y = c(1.2, -0.8, -0.8, 0.3, 0.3, -1.15, 0),
+  n = sapply(regions, length)
+)
+
+p_venn <- ggplot() +
+  geom_circle(data = circle_df, aes(x0 = x0, y0 = y0, r = r, fill = fill),
+              alpha = 0.4, color = "black", linewidth = 0.6) +
+  scale_fill_identity() +
+  geom_text(data = title_pos, aes(x = x, y = y, label = label),
+            size = 4.5, fontface = "bold") +
+  geom_text(data = label_pos, aes(x = x, y = y, label = paste0(letter, " (n=", n, ")")),
+            size = 4.5, fontface = "bold") +
+  coord_fixed(clip = "off") +
+  xlim(-3.2, 3.2) + ylim(-2.6, 3.6) +
+  theme_void()
+
+max_len <- max(sapply(regions, length))
+table_df <- as.data.frame(lapply(regions, function(x) {
+  length(x) <- max_len
+  x[is.na(x)] <- ""
+  x
+}))
+colnames(table_df) <- names(regions)
+
+tbl_grob <- tableGrob(
+  table_df,
+  rows = NULL,
+  theme = ttheme_minimal(
+    core = list(fg_params = list(hjust = 0, x = 0.05, fontsize = 9)),
+    colhead = list(fg_params = list(fontface = "bold", fontsize = 10),
+                   bg_params = list(fill = "grey90"))
+  )
+)
+
+p_final <- p_venn / wrap_elements(full = tbl_grob) +
+  plot_layout(heights = c(1.3, 2))
+
+ggsave(file.path(Figures, "venn_pathways_hNBO_vs_reference.pdf"),
+       p_final, width = 16, height = 15)
+
+```
+

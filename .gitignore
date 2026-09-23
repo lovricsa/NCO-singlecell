@@ -7,3 +7,5 @@ scvi-env/
 *.html
 .Rhistory
 .RData
+.Rproj.user
+*_old

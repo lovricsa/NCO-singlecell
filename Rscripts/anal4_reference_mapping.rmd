@@ -1,5 +1,5 @@
 ---
-title: "Analysis of single cell neuroblastoma organoids: part 2 - obtain cell type markers"
+title: "Analysis of single cell neuroblastoma organoids: part 4 - reference mapping"
 author: "Anna Lovrics"
 date: "`r Sys.Date()`"
 output:
@@ -17,58 +17,53 @@ output:
     toc: true
 ---
 ```{r setup, include=F}
-knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+knitr::opts_chunk$set(
+	fig.height = 5,
+	fig.width = 12,
+	message = FALSE,
+	warning = FALSE
+)
 ```
 
 The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
 The objective of this R Markdown code is to analyse the results obtained by the single cell RNA sequencing.
+Follow steps in readme to create Python environment for scVI integration
 
 ```{r libraries}
-knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
-# # install CRAN packages via BioConductor as well
-# if (!"BiocManager" %in% installed.packages()[,"Package"]){
-#   install.packages("BiocManager")
-# }
-# list.of.packages <- c("ggplot2", "ComplexHeatmap", "tidyHeatmap", 
-#                       "circlize", "limma", "edgeR", "dplyr", "tidyr",
-#                       "UpSetR", "ComplexUpset", "VennDiagram", "readr", "openxlsx", "readxl", 
-#                       "ggmagnify", "readr", "ggrepel")
-# new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
-# if(length(new.packages)) BiocManager::install(new.packages)
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
 
-library(Seurat)
-library(DoubletFinder) # for doublet detection
-library(scDblFinder) # a newer doublet detection tool
-library(SeuratWrappers)
-library(monocle3)
-library(ggplot2)
-library(patchwork) # to combine plots
-library(ggforce) # to add ellipse?
-library(Matrix)
-library(dplyr)
-library(here)
-library(stringr) # for the string replacements
-library(future) # for parallel Seurat runs
-library(clustree) # to visualize clusters
-library(scCustomize) # use scVI for integration, such as in Saldana-Guerero
-library(RColorBrewer)
-# for concave hulls:
-library(ggforce)
-library(concaveman)
-library(openxlsx)
-library(future) # in this case to stop parallelization
+packages <- c(
+  "Seurat",
+  "ggplot2",
+  "patchwork",
+  "Matrix",
+  "dplyr",
+  "here",
+  "stringr",
+  "future",
+  "scCustomize",
+  "ggforce",
+  "openxlsx",
+  "reticulate",
+  "FNN"
+)
+
+# TO DO: list packages in readme
+# missing <- setdiff(packages, rownames(installed.packages()))
+# 
+# # # install CRAN packages via BioConductor as well
+# if (length(missing) > 0) {
+#   BiocManager::install(missing, ask = FALSE)
+# }
+invisible(lapply(packages, library, character.only = TRUE))
 ```
 
-
-<!-- # Biztosan kellene sejt -->
-<!-- # populáció/cluster azonosítás marker gének alapján, pseudotime analízis -->
-<!-- # és CellChat vagy CellPhoneDB analízis is -> do CellChat: https://github.com/jinworks/CellChat1 -->
 
 Folder structure
 ```{r}
 Datafolder     <- here("Data")
-Data_calc <- here("Data_calculated") # Path to find Part 1 and 2 outputs
-
 # Subdirectories specifically isolated for this run's outputs
 Figures   <- here(file.path("Figures", "reference_mapping"))
 Data_calc <- here("Data_calculated")
@@ -83,764 +78,966 @@ utils_file <- here("Rscripts","utils.R")
 if (file.exists(utils_file)) source(utils_file)
 ```
 
-This is the same chunk as in anal3_selected_resolution -> better organization is needed than hard copy!
-Data is read and integrated separately for each cell type
+
+Config parameters and marker lists
 ```{r}
+config_file <- here("Rscripts","config.R")
+source(config_file)
 
-test_markers <- c("ASCL1", "CHGA", "HAND2", "TH")
-
-marker_list <- list(
-  proliferation = c("CDK1", "CENPF", "TOP2A", "UBE2C"), #vanHaver
-  #sympathoblast = c("CDK1", "PRPH", "ELAVL4", "ELAVL3", "ELAVL2", "ISL1", "STMN2", "GAP43", "GATA3", "PHOX2B", "SOX11", "TFAP2B",  "HMX1"), # Saldana?
-  sympathoblast = c("PRPH", "ELAVL2", "ELAVL3", "ELAVL4", "ISL1","STMN2", "STMN4", "GAP43", "GATA3", "PHOX2B", "SOX11", "SOX11", "TFAP2B"), #vanHaver
-  chromaffin = c("ADM", "CARTPT", "CHGA", "CHGB", "DBH", "DDC", "DLK1", "EGR1", "FOS", "JUNB", "PENK", "PNMT", "TH"), #vanHaver
-  #bridging = c("ASCL1", "MEIS1"), #vanHaver
-  bridging  = c("ASCL1", "MEIS1", "PHOX2B", "PENK", "TH", "CHGA", "HAND2"),
-  SCP = c("CDH19", "EDNRB", "ERBB3", "ERBB4", "FTS1", "FOXD3", "MPZ", "NR2F2", "PLP1", "SOX10", "SOX2", "SPARC"), #vanHaver
-  #SCP_other = c("SOX10", "PLP1", "FOXD3", "FABP7", "S100B", "ERBB3", "NGFR", "MPZ", "COL2A1", "POSTN", "MOXD1", "GAS7", "ASCL1"), #Saldana?
-  MES = c("COL1A1", "COL1A2", "COL12A1", "COL3A1", "VIM", "CXCL12", "TWIST1", "TWIST2") #Saldana fig2
-)
-
-vanHaver_list <- list(
-  immune = c(    "FCGR1A", "CD163" ),
-  liver = c(    "HNF4A",    "AHSG"  ),
-  erythroid = c(    "HBA2",    "HBB"  ),
-  adrenal_gland = c(    "NR5A1",    "STAR"  ),
-  CPC = c(    "PENK",    "CHGA",    "STMN2"  ),
-  sympathoblasts = c(    "STMN2"),
-  prolif_sym = c(    "STMN2",    "TOP2A"  ),
-  bridging = c(    "ASCL1"  ),
-  SCP = c(    "PLP1",    "SOX10"  ),
-  #subepicardial_abdominal_mesenchyme = c(    "PRRX1"  ),
-  sa_mes = c(    "PRRX1"  ),
-  endothelial = c(    "PECAM1",     "KDR"   ),
-  melanocyte_stem = c(    "MITF",    "PMEL"  ),
-  #endoneurial_fibroblasts = c(    "DCN",    "FBN1"  ),
-  endoneurial_fibroblasts = c(    "DCN",    "FBN1"  ),
-  myofibroblasts = c(    "ACTA2",    "TAGLN"  )
-)
-
-hox_list <- list(
-  "Cervical" = c("HOXA1", "HOXB1", "HOXA3", "HOXB3", "HOXD3"),
-  "Truncal" = c("HOXA5", "HOXB5", "HOXA6", "HOXA7", "HOXB7", "HOXB8", "HOXC8", "HOXD8", "HOXB9"),
-  "Lumbar-caudal" = c("HOXC9", "HOXD9", "HOXD11")
-)
-
-structure_list <- list(
-  "Basement Membrane" = c("LAMA2", "LAMB1", "LAMC3", "COL4A6", "COL12A1", "NID2"),
-  "ECM Assembly"      = c("COL1A1", "COL3A1", "COL6A3", "COL8A1", "BGN", "LUM", "POSTN", "FMOD", "DCN"),
-  "Cell Adhesion"     = c("CDH19", "CDH11", "CDH20", "MPZ", "CNTN2", "CNTNAP5", "CLDN5"),
-  "Tissue Patterning" = c("WNT1", "WNT7B", "WNT10B", "RSPO3", "DKK1", "DKK2", "SLITRK6", "ROBO3"),
-  "Axon/Structure"    = c("NRG1", "ERBB3", "LGI4", "RELN", "POU4F1", "UNCX")
-)
-
-# for the final manuscript:
-dimplot_list <- list(
-  "Cell Fate" = c("TH", "HOX2B", "GAP43", "STMN2", "ISL1", "CDKN1C", "CCND1"),
-  "Neuromesodermal progenitor" = c("TBXT", "SOX2"), # TBXT: Brachyury
-  "Proliferation" = c("PRPH", "SYN3", "GAP43", "NTRK1", "SOX4", "ALK", "MEIS2", "ERBB4", "VGF"),
-  "GFP" = c("EGFP", "MYCN"),
-  "Maturation Sympathoblasts" = c("CHRNA3", "VMAT1"), # VMAT1 missing
-  "Enteric Neurons" = c("EDNRB", "RET"),
-  "Sensory Neurons" = c("NGN1", "NGN2"), # missing?
-  "Endoneurial Fibroblasts" = c("DCN", "FBN1"),
-  "Myofibroblasts" = c("ACTA2", "TAGLN"),
-  "Melanocyte stem cell" = c("PMEL", "MITF"),
-  "SCP" = c("FOXD3", "SOX2", "SOX10", "MPZ", "S100B", "PLP1", "ERBB3"),
-  "Briding" = c("ASCL1", "PHOX2B", "PENK", "TH", "CHGA", "HAND2"),
-  "Symphatoblast" = c("GATA3", "ELAVL2", "ELAVL4", "ISL1", "STMN2", "STMN4", "PRPH")
-)
-
-violinplot_array <- c("AZIN1", "TFAP2B", "PRPH", "SYN3", "NTRK1", 
-                      "SOX4", "ALK", "MEIS2", "ERBB4", "VGF", "ACTB")
-
-# based on testing each selres differently, these selres are used for further analysis
-selres_list <- list(
-    "EpiC" = "SCT_snn_res.0.3",
-    "kolf2" = "SCT_snn_res.0.5" # changed to 0.5!!!
-)
-
-sample_names_dict <- c(
-    "1_EpiC_MIX_D26" = "H1 WT D26",
-    "2_EpiC_STOP_MYCN_D26" = "H1 STOP-MYCN D26",
-    "3_EpiC_STOP_MYCN_D42" = "H1 STOP-MYCN no virus D42",
-    "4_EpiC_STOP_MYCN_D42_hTH" = "H1 STOP-MYCN hTH-Cre D42",
-    "5_kolf2_MIX_D26" = "H2 WT D26",
-    "6_kolf2_STOP_MYCN_D26" = "H2 STOP-MYCN D26",
-    "7_kolf2_STOP_MYCN_D42" = "H2 STOP-MYCN no virus D42",
-   "8_kolf2_STOP_MYCN_D42_hTH" = "H2 STOP-MYCN hTH-Cre D42"
-  )
-
-# MES - off target
-new.cluster.ids.list <- list(
-      "EpiC" =      c(
-          "0" = "type_early/late_SCP", 
-          "1" =  "type_chr_sym", 
-          "2" =  "type_early_prog", 
-          "3" =   "type_early/late_endoneural_fibroblasts", # previously "type_MES", 
-          "4" = "type_early_SYM_like/mature_SYM",  # previously "type_maturing_neurons", # previously type_bridge
-          "5" = "type_early/late_myofibroblast",  # previously"type_MES_like",  # previously type_early_MES
-          "6" = "type_EGFP_MES",
-          "7" =  "type_bridging",   # previously "type_mature_SYM",
-          "8" = "type_EGFP_tumor"
-        ),
-      # "kolf2" =      c(
-      #     "0" = "type_chr_sym", 
-      #     "1" = "type_SCP", 
-      #     "2" = "type_SCP",
-      #     "3" = "type_MES", 
-      #     "4" = "type_MES", 
-      #     "5" = "type_EGFP_tumor", 
-      #     "6" = "type_mature_SYM",
-      #     "7" = "type_early_prog",
-      #     "8" = "type_EGFP_MES"
-      #   )
-      "kolf2" =      c(
-          "6" = "type_chromaffin", 
-          "1" = "type_symphatoblast", 
-          "7" = "type_bridging", 
-          "0" = "type_early_SCP", #
-          "3" = "type_late_SCP", #
-          "8" = "type_early_endoneural_fibroblasts", #
-          "9"=  "type_early_SYM_like", 
-          "2" = "type_late_endoneural_fibroblasts", #
-          "4" = "type_EGFP_tumor", #
-          "5" = "type_mature_sym", #
-          "10" = "type_early_prog", #
-          "11" = "type_EGFP_MES", #
-          "12" = "type_12"
-        )
-)
-
-cluster_names_dict <- list(
-      "EpiC" =  list(
-        "D26"=  c(
-          "type_early/late_SCP" = "early SCP", 
-          "type_chr_sym"= "chromaffin/symphatoblast", 
-          "type_early_prog"="early progenitor", 
-          "type_early/late_endoneural_fibroblasts"="early endoneural fibroblast", # previously "type_MES", 
-          "type_early_SYM_like/mature_SYM"= "early symphatoblast-like",  # previously "type_maturing_neurons", # previously type_bridge
-          "type_early/late_myofibroblast"="early myofibroblast",  # previously"type_MES_like",  # previously type_early_MES
-          "type_EGFP_MES"="EGFP MES",
-          "type_bridging"="bridging",   # previously "type_mature_SYM",
-          "type_EGFP_tumor"="EGFP tumor"
-        ),
-        "D42"=  c(
-          "type_early/late_SCP" = "late SCP", 
-          "type_chr_sym"= "chromaffin/symphatoblast", 
-          "type_early_prog"="late progenitor", 
-          "type_early/late_endoneural_fibroblasts"="late endoneural fibroblast", # previously "type_MES", 
-          "type_early_SYM_like/mature_SYM"= "mature symphatoblast",  # previously "type_maturing_neurons", # previously type_bridge
-          "type_early/late_myofibroblast"="late myofibroblast",  # previously"type_MES_like",  # previously type_early_MES
-          "type_EGFP_MES"="EGFP MES",
-          "type_bridging"="bridging",   # previously "type_mature_SYM",
-          "type_EGFP_tumor"="EGFP tumor"
-        ),
-        "all"=  c(
-          "type_early/late_SCP" = "early/late SCP", 
-          "type_chr_sym"= "chromaffin/symphatoblast", 
-          "type_early_prog"="early/late progenitor", 
-          "type_early/late_endoneural_fibroblasts"="early/late endoneural fibroblast", # previously "type_MES", 
-          "type_early_SYM_like/mature_SYM"= "mature symphatoblast / early symphatoblast-like",  # previously "type_maturing_neurons", # previously type_bridge
-          "type_early/late_myofibroblast"="early/late myofibroblast",  # previously"type_MES_like",  # previously type_early_MES
-          "type_EGFP_MES"="EGFP MES",
-          "type_bridging"="bridging",   # previously "type_mature_SYM",
-          "type_EGFP_tumor"="EGFP tumor"
-        )
-      ),
-     "kolf2" = list(
-        "D26"=  c(
-          "type_chromaffin"= "chromaffin", 
-          "type_symphatoblast" = "symphatoblast",
-          "type_early_SCP" = "early SCP",
-          "type_late_SCP" = "late SCP",
-          "type_early_endoneural_fibroblasts"="early endoneural fibroblast", # previously "type_MES", 
-          "type_early_SYM_like"= "early symphatoblast-like",  # previously "type_maturing_neurons", # previously type_bridge
-          "type_late_endoneural_fibroblasts"="late endoneural fibroblast", # previously "type_MES", 
-          "type_EGFP_tumor"="EGFP tumor",
-          "type_bridging"="bridging",   # previously "type_mature_SYM",
-          "type_early_prog"="early progenitor",
-          "type_EGFP_MES"="EGFP MES",
-          "type_12" = "cluster 12",
-          "type_mature_sym" = "mature symphatoblast"
-        ),
-        "D42"=  c(
-          "type_chromaffin"= "chromaffin", 
-          "type_symphatoblast" = "symphatoblast",
-          "type_early_SCP" = "early SCP",
-          "type_late_SCP" = "late SCP",
-          "type_early_endoneural_fibroblasts"="early endoneural fibroblast", # previously "type_MES", 
-          "type_early_SYM_like"= "early symphatoblast-like",  # previously "type_maturing_neurons", # previously type_bridge
-          "type_late_endoneural_fibroblasts"="late endoneural fibroblast", # previously "type_MES", 
-          "type_EGFP_tumor"="EGFP tumor",
-          "type_bridging"="bridging",   # previously "type_mature_SYM",
-          "type_early_prog"="early progenitor",
-          "type_EGFP_MES"="EGFP MES",
-          "type_12" = "cluster 12",
-          "type_mature_sym" = "mature symphatoblast"
-        ),
-        "all"=  c(
-          "type_chromaffin"= "chromaffin", 
-          "type_symphatoblast" = "symphatoblast",
-          "type_early_SCP" = "early SCP",
-          "type_late_SCP" = "late SCP",
-          "type_early_endoneural_fibroblasts"="early endoneural fibroblast", # previously "type_MES", 
-          "type_early_SYM_like"= "early symphatoblast-like",  # previously "type_maturing_neurons", # previously type_bridge
-          "type_late_endoneural_fibroblasts"="late endoneural fibroblast", # previously "type_MES", 
-          "type_EGFP_tumor"="EGFP tumor",
-          "type_bridging"="bridging",   # previously "type_mature_SYM",
-          "type_early_prog"="early progenitor",
-          "type_EGFP_MES"="EGFP MES",
-          "type_12" = "cluster 12",
-          "type_mature_sym" = "mature symphatoblast"
-        )
-      )
-)
-
-
-bio_order_list <- list("EpiC" = 
-                         c("type_early_prog", "type_early/late_myofibroblast", "type_early/late_endoneural_fibroblasts", "type_EGFP_MES",
-                           "type_early/late_SCP", "type_chr_sym", "type_bridging", "type_early_SYM_like/mature_SYM",
-                "type_EGFP_tumor"),
-               "kolf2" = 
-                         c("type_early_prog", "type_early_endoneural_fibroblasts", "type_late_endoneural_fibroblasts", "type_EGFP_MES",
-                           "type_early_SCP",  "type_late_SCP", "type_bridging", "type_early_SYM_like", "type_chromaffin", "type_symphatoblast", "type_mature_sym",
-                "type_EGFP_tumor", "type_12"))
-
-root_list <- list(
-   "EpiC"="type_SCP",
-   "kolf2"="type_SCP" 
-)
-
-# for colour coding the expr levels
-min_val <- 0
-max_val <- 2.5
-
-# number of genes used for integration
-nHVG <- 2000 # 2000 is usually enough to capture sub-states. (5000 HVGs might be too many for a single cell type.)
-nHVG_str <- as.character(nHVG)
-
+# for the same figures
+set.seed(734)
 ```
-
 
 
 
 Read in sample and reference data
 ```{r}
-
-nHVG <- 2000 # 2000 is usually enough to capture sub-states. (5000 HVGs might be too many for a single cell type.)
-nHVG_str <- as.character(nHVG)
-#ct <- "EpiC"
-ct <- "kolf2"
-# for (ct in c("EpiC", "kolf2")){
+# creation of reference atlas
+atlas_file <- file.path(Data_calc, "NB_reference_atlas.rds")
+if (!file.exists(atlas_file)){
+    
+  # ref_info is loaded from config.R
   
-    # outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
-    # use the new cluster names
-    outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
-    seu.integrated <- LoadSeuratRds(outfile)
-    # for the nice plots, remove "type_12" cluster
-    seu.integrated <- subset(seu.integrated, subset = !cluster_type %in% c("type_12"))
-    seu.integrated$cluster_type <- droplevels(seu.integrated$cluster_type)
-    # write out cell numbers
-    table(seu.integrated$sample.names, seu.integrated$cluster_type)
-
-    # next, use a loop for each reference
-    # 1. Define the datasets and the column names for their labels
-    # Update 'label_column' with the actual column names from these RDS files
-    ref_info <- list(
-      "Jansky" = list(path="Neuroblastoma_sc_Jansky.rds", label_col = "celltype"),
-      "Kameneva" = list(path="adrenal.human.seurat.scrublet.rds", label_col = "fate2"),
-      "adr"  = list(path = "adr_all.rds",  label_col = "Annotation"), # Kildisiute
-      "GOSH" = list(path = "nb_GOSH.rds", label_col = "Annotation"), # Kildisiute
-      "PMC"  = list(path = "nb_PMC.rds",  label_col = "Annotation"), # Kildisiute
-      "Saldana" = list(path = "GSE221853_ncnb_seurat_full.rds",  label_col = "type3"), # note: lot of mappings to previous studies is available!
-      "vanHaver" = list(path = "CellsOfInterest_SLB.rds",  label_col = "seurat_clusters")
-    )
-    
-    
-    outfile_new <- file.path(Data_calc, paste("seu_integrated_clusters_newnames_refscores_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
-    if (!file.exists(outfile_new)){
-          # 2. Set memory options (as you did before)
-    options(future.globals.maxSize = 50000 * 1024^2)
-    plan("sequential")
-    
-    # 3. Start the loop
-    ref_objects <- list()
-    for (ref_name in names(ref_info)) {
-      
-      message(paste("--- Processing Reference:", ref_name, "---"))
-      # check if the anchoring was already done:
-      if (paste0("pred.", ref_name) %in% names(seu.integrated@meta.data)){
-        print("reference already processed and added")
-      } else {
-        ref_file <- file.path(Data_calc, paste("ref_", ref_name, ".rds", sep=""))
-        if (file.exists(ref_file)){
-          ref_obj <- LoadSeuratRds(file=ref_file)
-          if (ref_name=="vanHaver") ref_info[[ref_name]]$label_col <- "annotation"
-        } else {
-          # A. Load and Process Reference
-          ref_obj <- readRDS(file.path(Data_public, ref_info[[ref_name]]$path))
-          ref_obj <- UpdateSeuratObject(ref_obj)
-          
-          # for the van-Haver data, rename clusters as in the paper
-          if (ref_name=="vanHaver"){
-            new_ids <- c("0"="SCP", "9"="SCP", "1"="bridge", "10"="bridge", "4"="CPC", "8"="CPC",   "6"="CPC", "2"="CPC", "7"="prolif", "3"="sympathoblast", "5"="sympathoblast")
-            Idents(ref_obj) <- "seurat_clusters"
-            ref_obj <- RenameIdents(ref_obj, new_ids)
-            ref_obj$annotation <- Idents(ref_obj)
-            ref_info[[ref_name]]$label_col <- "annotation"
-          }
-          
-          # Downsample if it's a huge dataset (highly recommended for NB datasets)
-          Idents(ref_obj) <- ref_info[[ref_name]]$label_col
-          ref_obj <- subset(ref_obj, downsample = 1000)
-          sort(table(ref_obj[[ref_info[[ref_name]]$label_col]]))
-          
-          ref_obj <- SCTransform(ref_obj, vst.flavor = "v2", verbose = T)
-          ref_obj <- RunPCA(ref_obj, verbose = T)
-          ref_obj <- RunUMAP(ref_obj, dims = 1:30, reduction = "pca", return.model = TRUE)
-          SaveSeuratRds(ref_obj, file=ref_file)
-        }
-        
-        # B. Find Anchors
-        anchors <- FindTransferAnchors(
-          reference = ref_obj,
-          query = seu.integrated,
-          normalization.method = "SCT",
-          reference.reduction = "pca",
-          dims = 1:30
-        )
-        
-        # C. Map Query and Transfer Labels
-        # We use the ref_name to create unique metadata columns in your query object
-        seu.integrated <- MapQuery(
-          anchorset = anchors,
-          reference = ref_obj,
-          query = seu.integrated,
-          refdata = list(prediction = ref_info[[ref_name]]$label_col),
-          reference.reduction = "pca", 
-          reduction.model = "umap"
-        )
-        
-        # D. Rename the transferred metadata columns so they don't get overwritten in the next loop
-        # This stores them as "pred.adr", "pred.GOSH", etc.
-        seu.integrated[[paste0("pred.", ref_name)]] <- seu.integrated$predicted.prediction
-        seu.integrated[[paste0("score.", ref_name)]] <- seu.integrated$predicted.prediction.score
-        
-        ref_objects[[ref_name]] <- ref_obj
-        
-        # E. Clean up memory before next dataset
-        rm(ref_obj, anchors)
-        gc()
-      } # end of if/else of processing reference
-      
-    } # enf of loop ref_name in names(ref_info)
-    
-    # new save the new seurat object
-    SaveSeuratRds(seu.integrated, file = outfile_new)
-    } else {
-      seu.integrated <- LoadSeuratRds(outfile_new)
-    }
-    
-
-    # plot all of them - TO DO - do it automatically
-    cols_to_plot <- paste("pred.", names(ref_info), sep="")
-    
-    # calculate confidence of each score:
-    summary_list <- list()
-    for (ref in cols_to_plot) {
-      rscore <- gsub("pred.", "score.", ref)
-      rqual <- gsub("score.", "qual.", rscore)
-      seu.integrated[[rqual]] <- ifelse(
-      seu.integrated[[rscore]] >= 0.5, 
-      "High (>0.5)", 
-      "Low (<0.5)"
-         )
-
-    counts <- table(seu.integrated[[rqual]])
-    percent <- round(100 * prop.table(counts), 2)
+  ref_names <- names(ref_info)
   
-    summary_list[[ref]] <- data.frame(
-      Classification = names(counts),
-      Count = as.numeric(counts),
-      Percentage = as.numeric(percent)
-    )  
+  refs <- lapply(ref_names, function(ref_name){
+  
+    message("Loading ", ref_name)
+  
+    obj <- readRDS(file.path(Data_public, ref_info[[ref_name]]$path))
+    obj <- UpdateSeuratObject(obj)
+  
+    obj$reference_source <- ref_name
+  
+    obj
+  })
+  
+  names(refs) <- ref_names 
+  
+  # list possibilities
+  for (ri in 1:length(refs)){
+    print(ref_names[ri])
+    print(unique(refs[[ri]]@meta.data[[ref_info[[ri]]$label_col]]))
+    print("")
   }
-
-
-    # 2. Create a list of plots
-    plot_list <- list()
-    for (ref in cols_to_plot) {
-      print(ref)
-      rscore <- gsub("pred.", "score.", ref)
-      rqual <- gsub("score.", "qual.", rscore)
-      # Check if the column exists to avoid errors
-      if (ref %in% colnames(seu.integrated@meta.data)) {
-        
-        p <- DimPlot(seu.integrated, 
-                     reduction = "umap", 
-                     group.by = ref, 
-                     #split.by = rqual,
-                     label = TRUE, 
-                     label.size = 6, 
-                     repel = TRUE) + 
-          ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
-          # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
-          theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-        
-        plot_list[[ref]] <- p
-        # also save
-        ggsave(file.path(Figures, paste("Dimplot_ref_", ref, "_", ct,
-                      "_all_nHVG", nHVG_str,".pdf", sep="")), p, width = 10,   height = 6)
-      }
-    }
-    
-    
-      # 3. Plot for specific days
-    day <- "D26_WT"
-    seu.day <- subset_seu_by_day(seu.integrated, day)
-      
-    # drop unused levels - do it everywhere!!!
-      cluster_sizes <- table(seu.day$cluster_type)
-      keep_clusters <- names(cluster_sizes[cluster_sizes >= 10])
-      seu.day <- subset(
-      seu.day, subset = cluster_type %in% keep_clusters)
-      seu.day@meta.data <- droplevels(seu.day@meta.data)
-      
-    plot_list <- list()
-    for (ref in c("pred.Saldana", "pred.vanHaver", "pred.Kameneva", "pred.adr")){
-      print(ref)
-      rscore <- gsub("pred.", "score.", ref)
-      rqual <- gsub("score.", "qual.", rscore)
-      # Check if the column exists to avoid errors
-      if (ref %in% colnames(seu.day@meta.data)) {
-        
-        p <- DimPlot(seu.day, 
-                     reduction = "umap", 
-                     group.by = ref, 
-                     #split.by = rqual,
-                     label = TRUE, 
-                     label.size = 6, 
-                     repel = TRUE) + 
-          ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
-          # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
-          theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-        
-        # plot_list[[ref]] <- p
-        # also save
-        ggsave(file.path(Figures, paste("Dimplot_ref_", ref, "_", ct,
-                      "_day_", day, 
-                      "_nHVG", nHVG_str,".pdf", sep="")), p, width = 10,   height = 6)
-      }
-    }
-    
-    # 4. Plot for specific clusters on specific days
-    day <- "D42_hTH"
-    seu.day <- subset_seu_by_day(seu.integrated, day)
-    
-        # use new names
-    actual_day <- limma::strsplit2(day, "_")[[1]]
-    
-    # Rename clusters from previous annotation
-    bio_order <- bio_order_list[[ct]]
-    if (actual_day %in% names(cluster_names_dict[[ct]])){
-          new_cluster_ids <- dplyr::recode(
-        as.character(seu.day$cluster_type),
-        !!!cluster_names_dict[[ct]][[actual_day]]
-      )
-      # Preserve cluster order
-      renamed_cluster_order <- dplyr::recode(
-        bio_order,
-        !!!cluster_names_dict[[ct]][[actual_day]]
-      )
-      
-      new_cluster_ids <- factor(
-        new_cluster_ids,
-        levels = renamed_cluster_order
-      )
-      
-      # Store back into Seurat object and construct final legend text
-      seu.day$cluster_type_renamed <- new_cluster_ids
-      Idents(seu.day) <- "cluster_type_renamed"
-    }
-      
-    # drop unused levels - do it everywhere!!!
-      cluster_sizes <- table(seu.day$cluster_type)
-      keep_clusters <- names(cluster_sizes[cluster_sizes >= 10])
-      seu.day <- subset(
-      seu.day, subset = cluster_type %in% keep_clusters)
-      seu.day$cluster_type <- droplevels(seu.day$cluster_type)
-      
-      
-    # also pick one cluster
-    # table(seu.day$cluster_type_renamed_D42_hTH)
-    sel_ident_str <- paste("cluster_type_renamed")
-    sel_ident_sym <- sym(sel_ident_str)
-    sel_clus <- "EGFP tumor"
-    sel_clus_str <- gsub(" ", "_", sel_clus)
-    seu.clus <- subset(seu.day, subset = !!sel_ident_sym %in% sel_clus)
-    #seu.clus[[sel_ident_str]] <- droplevels(seu.clus[[sel_ident_str]])
-    seu.clus@meta.data <- droplevels(seu.clus@meta.data) # drop unused levels everywhere
-    
-    plot_list <- list()
-    for (ref in c("pred.GOSH", "pred.PMC")){
-      print(ref)
-      rscore <- gsub("pred.", "score.", ref)
-      rqual <- gsub("score.", "qual.", rscore)
-      # Check if the column exists to avoid errors
-      if (ref %in% colnames(seu.clus@meta.data)) {
-        
-        p <- DimPlot(seu.clus, 
-                     reduction = "umap", 
-                     group.by = ref, 
-                     #split.by = rqual,
-                     label = TRUE, 
-                     label.size = 6, 
-                     repel = TRUE) + 
-          ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
-          # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
-          theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-        
-        # plot_list[[ref]] <- p
-        # also save
-        ggsave(file.path(Figures, paste("Dimplot_ref_", ref, "_", ct,
-                      "_day_", day, "_cluster_", sel_clus_str,  
-                      "_nHVG", nHVG_str,".pdf", sep="")), p, width = 10,   height = 6)
-      }
-    }
-    
-        # GOSH risk stratification
-# 1. Initialize the column in the Seurat object
-    ref_objects[["GOSH"]]$risk <- NA
-    
-    # 2. Grab the SampleName vector directly from the metadata to use as your test
-    sample_names <- ref_objects[["GOSH"]]$SampleName
-    
-    # 3. Assign the risks based on that vector
-    ref_objects[["GOSH"]]$risk[sample_names %in% "PD43255"] <- "high"
-    ref_objects[["GOSH"]]$risk[sample_names %in% "PD42752-1"] <- "intermed"
-    ref_objects[["GOSH"]]$risk[sample_names %in% c("PD42752-2", "PD46693")] <- "low"
-    table(ref_objects[["GOSH"]]$risk)
-    
-    # add to seu.clus
-    ref_obj <- ref_objects[["GOSH"]]
-    Idents(ref_obj) <- "risk"
-          
-    # B. Find Anchors
-    anchors <- FindTransferAnchors(
-    reference = ref_obj,
-    query = seu.clus,
-    normalization.method = "SCT",
-    reference.reduction = "pca",
-    dims = 1:30)
-      
-    # C. Map Query and Transfer Labels
-    # We use the ref_name to create unique metadata columns in your query object
-    seu.clus <- MapQuery(
-      anchorset = anchors,
-      reference = ref_obj,
-      query = seu.clus,
-      refdata = list(prediction = "risk"),
-      reference.reduction = "pca", 
-      reduction.model = "umap"
+  
+  # # create harmonized annotation
+  # common_labels <- c(
+  #   "tumor", "SCP", "bridge", "CPC", "sympathoblast",
+  #   "chromaffin",  "prolif",  "immune", "mesenchymal",
+  #   "endothelial", "cortex", "kidney",   "liver",
+  #   "melanocyte",    "erythroid",   "HSC",
+  #   "unknown" ) # fallback
+  
+  # recode references
+  refs[["Jansky"]]$celltype_harmonized <- recode_labels(
+    refs[["Jansky"]]$celltype,
+    c(
+      "Tumor cells" = "tumor",
+      "Immune cells" = "other",
+      "Mesenchymal cells" = "mesenchymal",
+      "Endothelial cells" = "endothelial",
+      "Schwann cells" = "SCP",
+      "Liver cells" = "other"
     )
+  )
+  
+  refs[["Kameneva"]]$celltype_harmonized <- recode_labels(
+    refs[["Kameneva"]]$fate2,
+    c(
+      "SCP" = "SCP",
+      "sympathoblasts" = "sympathoblast",
+      "chromaffin" = "chromaffin",
+      "cortex" = "other",
+      "HSC_and_immune" = "other",
+      "erythroid" = "other",
+      "mesenchyme" = "mesenchymal",
+      "endothelium" = "endothelial",
+      "kidney" = "other",
+      "liver" = "other",
+      "melanocytes" = "other",
+      "intermediate_mesoderm" = "mesenchymal"
+    )
+  )
+  
+  
+  refs[["adr"]]$celltype_harmonized <- recode_labels(
+    refs[["adr"]]$Annotation,
+    c(
+      "SCPs" = "SCP",
+      "Bridge" = "bridge",
+      "Sympathoblastic" = "sympathoblast",
+      "Chromaffin" = "chromaffin",
+      "Cortex" = "other",
+      "Leukocytes" = "other",
+      "Mesenchyme" = "mesenchymal",
+      "Endothelium" = "endothelial",
+      "Erythroblasts" = "other",
+      "Other" = "other"
+    )
+  )
       
-    # D. Rename the transferred metadata columns so they don't get overwritten in the next loop
-    # This stores them as "pred.adr", "pred.GOSH", etc.
-    seu.clus[[paste0("pred.", "GOSH.risk")]] <- seu.clus$predicted.prediction
-    seu.clus[[paste0("score.", "GOSH.risk")]] <- seu.clus$predicted.prediction.score
+  refs[["GOSH"]]$celltype_harmonized <- recode_labels(
+    refs[["GOSH"]]$Annotation,
+    c(
+      "Tumour cluster 1" = "tumor",
+      "Tumour cluster 2" = "tumor",
+      "Tumour cluster 3" = "tumor",
+      "Leukocytes" = "other",
+      "Mesenchyme" = "mesenchymal",
+      "Endothelium" = "endothelial"
+    )
+  )    
       
-    plot_list <- list()
-    for (ref in c("pred.GOSH.risk")){
-      print(ref)
-      rscore <- paste0("pred.", "GOSH.risk")
-      scrqual <- paste0("score.", "GOSH.risk")
-      # Check if the column exists to avoid errors
-      if (ref %in% colnames(seu.clus@meta.data)) {
-        
-        p <- DimPlot(seu.clus, 
-                     reduction = "umap", 
-                     group.by = ref, 
-                     split.by = rqual,
-                     label = TRUE, 
-                     label.size = 6, 
-                     repel = TRUE) + 
-          ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
-          # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
-          theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-        
-        # plot_list[[ref]] <- p
-        # also save
-        # ggsave(file.path(Figures, paste("Dimplot_ref_", ref, "_", ct,
-        #               "_day_", day, "_cluster_", sel_clus_str,  
-        #               "_nHVG", nHVG_str,".pdf", sep="")), p, width = 10,   height = 6)
-      }
-    }
-
+  refs[["PMC"]]$celltype_harmonized <- recode_labels(
+    refs[["PMC"]]$Annotation,
+    c(
+      "Tumour cluster 1" = "tumor",
+      "Tumour cluster 2" = "tumor",
+      "Tumour cluster 3" = "tumor",
+      "Schwannian stroma" = "SCP",
+      "Mesenchyme" = "mesenchymal",
+      "Leukocytes" = "other",
+      "Endothelium" = "endothelial",
+      "Ambiguous 1" = "other",
+      "Ambiguous 2" = "other"
+    )
+  )
+  
+  
+  refs[["Saldana"]]$celltype_harmonized <- recode_labels(
+    refs[["Saldana"]]$type3,
+    c(
+      "SCP" = "SCP",
+      "sympathoblasts" = "sympathoblast",
+      "chromaffin" = "chromaffin",
+      "mesenchyme" = "mesenchymal",
+      "other" = "other"
+    )
+  )
+  
+  refs[["vanHaver"]]$celltype_harmonized <- recode_labels(
+    refs[["vanHaver"]]$seurat_clusters,
+    c(
+      "0" = "SCP",
+      "9" = "SCP",
+      "1" = "bridge",
+      "10" = "bridge",
+      "4" = "CPC",
+      "8" = "CPC",
+      "6" = "CPC",
+      "2" = "CPC",
+      "7" = "prolif",
+      "3" = "sympathoblast",
+      "5" = "sympathoblast"
+    )
+  )
+  
+  # sanity check:
+  lapply(refs, function(x) {
+    sort(table(x$celltype_harmonized), decreasing = TRUE)
+  })
+  
+  # check how much gets lost
+  lapply(refs, function(x) {
+    mean(x$celltype_harmonized == "other")
+  })
+  
+  # for (rname in names(refs)){
+  #   # there are a huge number of uknown -> remove
+  #   refs[[rname]] <- subset(
+  #     refs[[rname]],
+  #     subset = !celltype_harmonized %in% c("other")
+  #   )
+  # }
+  
+  # downsample huge populations
+  for(i in seq_along(refs)){
+  
+    Idents(refs[[i]]) <- "celltype_harmonized"
     
+    print(table(refs[[i]]$celltype_harmonized))
+    
+    refs[[i]] <- subset(
+      refs[[i]],
+      downsample = 500
+    )
+    
+    # after downsampling
+    print("after downsampling:")
+    print(table(refs[[i]]$celltype_harmonized))
+    print("===")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # Create harmonized, transformed, downsampled reference files
+  #
+  # These are saved separately for downstream analyses.
+  # They are NOT used to construct the merged reference atlas below.
+  # ---------------------------------------------------------------------------
+  
+  message("Creating harmonized, transformed, downsampled reference files...")
+  
+  for (ref_name in names(refs)) {
+  
+    message("Transforming ", ref_name)
+    
+    ref_obj <- refs[[ref_name]]
+    
+    ref_obj <- SCTransform(
+      ref_obj,
+      vst.flavor = "v2"
+    )
+    
+    ref_obj <- RunPCA(
+      ref_obj
+    )
+    
+    ref_obj <- RunUMAP(
+      ref_obj,
+      dims = 1:30,
+      reduction = "pca",
+      return.model = TRUE
+    )
+  
+    SaveSeuratRds(
+      ref_obj,
+      file = file.path(
+        Data_calc,
+        paste0(
+          "ref_",
+          ref_name,
+          "_harmonized_transformed_downsampled.rds"
+        )
+      )
+    )
+  }
+  
+  # ---------------------------------------------------------------------------
+  # Create the merged reference atlas
+  #
+  # The atlas itself uses one consistent workflow across all references:
+  # RNA normalization -> HVG selection -> scaling -> PCA -> UMAP.
+  #
+  # The individually SCTransformed reference objects above are not used here.
+  # ---------------------------------------------------------------------------
+  
+  message("Merging reference datasets")
+  
+  merged.ref <- merge(
+    refs[[1]],
+    y = refs[-1]
+  )
+  
+  # no need to join layers, since earlier seurat type data
+  DefaultAssay(merged.ref) <- "RNA"
+  
+  print(table(merged.ref$celltype_harmonized))
+  
+  # normalize merged reference and identify HVGs
+  message("Normalizing merged reference and identifying HVGs...")
+  
+  merged.ref <- NormalizeData(
+    merged.ref
+  )
+  
+  merged.ref <- FindVariableFeatures(
+    merged.ref,
+    nfeatures = 3000
+  )
+  
+  hvg <- VariableFeatures(merged.ref)
+  
+  # This will be needed for the anchor step
+  message("Scaling data and running Reference PCA...")
+  
+  merged.ref <- ScaleData(
+    merged.ref,
+    features = hvg,
+    verbose = FALSE
+  )
+  
+  merged.ref <- RunPCA(
+    merged.ref,
+    npcs = 30,
+    features = hvg,
+    verbose = FALSE
+  )
+  
+  # ---------------------------------------------------------------------------
+  # Build the reference UMAP model from the same PCA representation
+  # used for the downstream anchor workflow.
+  # ---------------------------------------------------------------------------
+  
+  message("Building reference UMAP model...")
+  
+  merged.ref <- RunUMAP(
+    merged.ref,
+    reduction = "pca",
+    dims = 1:30,
+    n.neighbors = 30L,
+    metric = "cosine",
+    min.dist = 0.3,
+    return.model = TRUE,
+    reduction.name = "umap",
+    reduction.key = "UMAP_",
+    verbose = FALSE
+  )
+  
+  # QC plot
+  p1 <- DimPlot(
+    merged.ref,
+    reduction = "umap",
+    group.by = "reference_source"
+  )
+  
+  p2 <- DimPlot(
+    merged.ref,
+    reduction = "umap",
+    group.by = "celltype_harmonized",
+    label = TRUE,
+    cols = atlas_palette
+  )
+  
+  combined_plot <- p1 | p2
+  
+  plot(combined_plot)
+  
+  ggsave(
+    file.path(
+      Figures,
+      paste("Atlas", ".pdf", sep = "")
+    ),
+    combined_plot,
+    width = 10,
+    height = 6
+  )
+  
+  # Run a quick loop across the references to print an identity matrix
+  for(name in names(ref_info)) {
+    
+    cat("\n=============================================\n")
+    cat(
+      "  HARMONIZATION AUDIT TRAIL FOR:",
+      toupper(name),
+      "\n"
+    )
+    cat("=============================================\n")
+    
+    orig_col <- ref_info[[name]]$label_col
+    
+    # Filter the merged atlas metadata for just this specific source
+    sub_meta <- merged.ref@meta.data[
+      merged.ref$reference_source == name,
+    ]
+    
+    # Print the cross-tabulation table
+    print(
+      table(
+        Original_Label = sub_meta[[orig_col]],
+        Harmonized_Label = sub_meta$celltype_harmonized
+      )
+    )
+  }
+  
+  # finally save the atlas!
+  SaveSeuratRds(
+    merged.ref,
+    file = atlas_file
+  )
+  
+} else {
+  
+  print("Atlas already saved, load saved object")
+  
+  merged.ref <- LoadSeuratRds(atlas_file)
+  
+  # Re-attach the uwot model, since it does not survive serialization
+  merged.ref[["umap"]]@misc$model <- uwot::load_uwot(
+    file.path(Data_calc, "atlas_umap_model")
+  )
+  
+} # end of reference atlas creating
+```
 
+
+<!-- ```{r scvi mapping} -->
+<!-- # now the mapping -->
+<!-- ct <- "EpiC" -->
+<!-- # ct <- "kolf2" -->
+
+<!-- # outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", ct, "_all_nHVG", nHVG_str, ".rds", sep="")) -->
+<!-- # use the new cluster names -->
+<!-- outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep="")) -->
+<!-- seu.integrated <- LoadSeuratRds(outfile) -->
+<!-- # for the nice plots, remove "type_12" cluster -->
+<!-- seu.integrated <- subset(seu.integrated, subset = !cluster_type %in% c("type_12")) -->
+<!-- seu.integrated$cluster_type <- droplevels(seu.integrated$cluster_type) -->
+<!-- # write out cell numbers -->
+<!-- table(seu.integrated$sample.names, seu.integrated$cluster_type) -->
+
+
+<!-- # mapping the latent space as well -->
+<!-- # ---- Embed the query into the reference's scVI latent space (scArches surgery) ---- -->
+
+<!-- reticulate::use_virtualenv(here("scvi-env"), required = TRUE) -->
+<!-- scvi <- import("scvi") -->
+<!-- sp   <- import("scipy.sparse") -->
+<!-- ad   <- import("anndata") -->
+
+<!-- scvi_model_dir <- file.path(Data_calc, "scvi_reference_model") -->
+<!-- hvg <- readRDS(file.path(Data_calc, "scvi_reference_hvg.rds")) -->
+
+<!-- DefaultAssay(seu.integrated) <- "RNA" -->
+<!-- query_counts <- GetAssayData(seu.integrated, assay = "RNA", layer = "counts") -->
+
+<!-- # scVI needs exactly the same gene set/order used for training the reference -->
+<!-- missing_genes <- setdiff(hvg, rownames(query_counts)) -->
+<!-- if (length(missing_genes) > 0) { -->
+<!--   message(length(missing_genes), " reference HVGs missing in query; padding with zeros") -->
+<!--   pad <- Matrix::Matrix(0, nrow = length(missing_genes), ncol = ncol(query_counts), sparse = TRUE) -->
+<!--   rownames(pad) <- missing_genes -->
+<!--   query_counts <- rbind(query_counts, pad) -->
+<!-- } -->
+<!-- query_counts <- query_counts[hvg, ] -->
+<!-- query_counts@x <- round(query_counts@x)   # raw counts required -->
+
+<!-- query_meta <- seu.integrated@meta.data -->
+<!-- query_meta$reference_source <- "query"    # unseen batch label — required by scVI's setup -->
+
+<!-- adata_query <- ad$AnnData( -->
+<!--   X   = sp$csr_matrix(t(query_counts)), -->
+<!--   obs = query_meta, -->
+<!--   var = data.frame(gene_names = hvg, row.names = hvg) -->
+<!-- ) -->
+
+<!-- # Load reference model, register the query, fine-tune only the query-specific -->
+<!-- # weights while the reference latent space stays fixed — this is what makes -->
+<!-- # query and reference land in the SAME coordinate system -->
+<!-- scvi$model$SCVI$prepare_query_anndata(adata_query, scvi_model_dir) -->
+<!-- query_model <- scvi$model$SCVI$load_query_data(adata_query, scvi_model_dir) -->
+<!-- query_model$train(max_epochs = as.integer(200), plan_kwargs = list(weight_decay = 0.0)) -->
+
+<!-- latent_query <- as.matrix(query_model$get_latent_representation()) -->
+<!-- colnames(latent_query) <- paste0("scviref_", seq_len(ncol(latent_query))) -->
+<!-- rownames(latent_query) <- colnames(seu.integrated) -->
+
+<!-- seu.integrated[["scvi.ref"]] <- CreateDimReducObject( -->
+<!--   embeddings = latent_query, key = "scviref_", assay = "RNA" -->
+<!-- ) -->
+
+<!-- # ---- Transfer labels by k-NN in the shared scVI latent space ---- -->
+<!-- # (replaces FindTransferAnchors/MapQuery, which assumes a linear reduction) -->
+
+<!-- ref_latent <- Embeddings(merged.ref, "scvi") -->
+<!-- ref_labels <- factor(merged.ref$celltype_harmonized) -->
+
+<!-- k <- 30 -->
+<!-- knn <- FNN::get.knnx(data = ref_latent, query = latent_query, k = k) -->
+
+<!-- vote_frac <- t(apply(knn$nn.index, 1, function(idx) { -->
+<!--   prop.table(table(ref_labels[idx])) -->
+<!-- })) -->
+<!-- colnames(vote_frac) <- paste0("vote_", colnames(vote_frac)) -->
+
+<!-- seu.integrated$atlas_pred_celltype <- gsub( -->
+<!--   "^vote_", "", colnames(vote_frac)[max.col(vote_frac, ties.method = "first")] -->
+<!-- ) -->
+<!-- seu.integrated$atlas_pred_score <- apply(vote_frac, 1, max) -->
+<!-- seu.integrated <- AddMetaData(seu.integrated, as.data.frame(vote_frac)) -->
+
+
+<!-- # ---- Optional: project query onto the reference's existing scVI-UMAP for plotting ---- -->
+<!-- # # Requires the reference UMAP (built on "scvi") to have been created with return.model = TRUE -->
+<!-- seu.integrated <- RunUMAP( -->
+<!--   seu.integrated, -->
+<!--   reduction       = "scvi.ref",           # the query embedding already stored in the object -->
+<!--   dims            = 1:ncol(latent_query), # 1:30, matching the scVI latent dimensionality -->
+<!--   reduction.model = merged.ref[["umap"]], # the scVI-based reference UMAP model -->
+<!--   reduction.name  = "ref.umap", -->
+<!--   reduction.key   = "refUMAP_" -->
+<!-- ) -->
+
+<!-- # end of mapping -->
+
+<!-- # ---- Audit of prediction performance ---- -->
+<!-- # (atlas_pred_celltype, atlas_pred_score, and vote_* columns were already -->
+<!-- # added to seu.integrated@meta.data by the k-NN voting step above) -->
+<!-- vote_cols <- grep("^vote_", colnames(seu.integrated@meta.data), value = TRUE) -->
+<!-- voting_matrix <- seu.integrated@meta.data[, c("atlas_pred_celltype", "atlas_pred_score", vote_cols)] -->
+<!-- head(voting_matrix) -->
+
+<!-- # ---- Plot confidence ---- -->
+<!-- p_vln <- VlnPlot( -->
+<!--   seu.integrated, features = "atlas_pred_score", -->
+<!--   group.by = "atlas_pred_celltype", pt.size = 0.1, -->
+<!--   cols = atlas_palette -->
+<!-- ) + -->
+<!--   geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") + -->
+<!--   theme(axis.text.x = element_text(angle = 45, hjust = 1)) + -->
+<!--   ggtitle("Label Transfer Confidence by Cell Type") -->
+
+<!-- ggsave( -->
+<!--   file.path(Figures, paste("Label_transfer_confidence_scvi_", ct, ".pdf", sep="")), -->
+<!--   plot = p_vln, width = 10, height = 6 -->
+<!-- ) -->
+
+<!-- # ---- PLOT A: atlas labels on the query's own UMAP layout ---- -->
+<!-- # NOTE: "umap" here is the per-cell-type scVI UMAP from Part 2, not the reference mapping -->
+<!-- p_query_umap <- DimPlot( -->
+<!--   seu.integrated, -->
+<!--   reduction = "umap", -->
+<!--   group.by = "atlas_pred_celltype", -->
+<!--   cols = atlas_palette, -->
+<!--   label = FALSE, label.size = 5, repel = TRUE -->
+<!-- ) + -->
+<!--   ggtitle("Query UMAP colored by Atlas Predictions") + -->
+<!--   theme(plot.title = element_text(hjust = 0.5, face = "bold")) -->
+<!-- print(p_query_umap) -->
+
+<!-- # ---- PLOT B: query cells projected onto the reference atlas UMAP ---- -->
+<!-- p_projected_umap <- DimPlot( -->
+<!--   seu.integrated, -->
+<!--   reduction = "ref.umap", -->
+<!--   group.by = "atlas_pred_celltype", -->
+<!--   cols = atlas_palette, -->
+<!--   label = FALSE, label.size = 5, repel = TRUE -->
+<!-- ) + -->
+<!--   ggtitle("Query Cells Projected onto Reference Atlas UMAP") + -->
+<!--   theme(plot.title = element_text(hjust = 0.5, face = "bold")) -->
+<!-- print(p_projected_umap) -->
+
+<!-- # ---- Save both plots ---- -->
+<!-- ggsave( -->
+<!--   file.path(Figures, paste("Query_UMAP_with_Atlas_Labels_scvi_", ct, ".pdf", sep="")), -->
+<!--   plot = p_query_umap, width = 10, height = 6 -->
+<!-- ) -->
+<!-- ggsave( -->
+<!--   file.path(Figures, paste("Query_Projected_onto_Atlas_UMAP_scvi_", ct, ".pdf", sep="")), -->
+<!--   plot = p_projected_umap, width = 10, height = 6 -->
+<!-- ) -->
+
+
+<!-- ``` -->
+
+
+
+```{r seurat mapping}
+# now the mapping
+ct <- "EpiC"
+# ct <- "kolf2"
+  
+# outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+# use the new cluster names
+outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+seu.integrated <- LoadSeuratRds(outfile)
+# for the nice plots, remove "type_12" cluster
+seu.integrated <- subset(seu.integrated, subset = !cluster_type %in% c("type_12"))
+seu.integrated$cluster_type <- droplevels(seu.integrated$cluster_type)
+# write out cell numbers
+table(seu.integrated$sample.names, seu.integrated$cluster_type)
+
+# Switch query to RNA assay and ensure it is log-normalized
+# (This is safe, fast, and does not alter your query's SCT integration embeddings)
+DefaultAssay(seu.integrated) <- "RNA"
+seu.integrated <- NormalizeData(seu.integrated, verbose = FALSE)
+
+# 2. Find Transfer Anchors using LogNormalize matching your upstream data
+message("Finding transfer anchors...")
+anchors <- FindTransferAnchors(
+  reference = merged.ref,
+  query = seu.integrated,
+  normalization.method = "LogNormalize", # <-- Use LogNormalize instead of SCT
+  reduction = "pcaproject",               # Projects query onto ref PCA space (ultra-fast)
+  reference.reduction = "pca",
+  dims = 1:30
+)
+
+# 4. Map Query to Reference
+message("Mapping query to reference...")
+seu.integrated <- MapQuery(
+  anchorset = anchors,
+  reference = merged.ref,
+  query = seu.integrated,
+  refdata = list(predicted_celltype = "celltype_harmonized"),
+  reference.reduction = "pca",
+  reduction.model = "umap"
+)
+
+# 1. Clean up and store the transferred metadata under permanent names
+seu.integrated$atlas_pred_celltype <- seu.integrated$predicted.predicted_celltype
+seu.integrated$atlas_pred_score    <- seu.integrated$predicted.predicted_celltype.score
+
+# audit of prediction performance
+score_columns <- grep("predicted_celltype.score.", colnames(seu.integrated@meta.data), value = TRUE)
+voting_matrix <- seu.integrated@meta.data[, c("atlas_pred_celltype", "atlas_pred_score", score_columns)]
+colnames(voting_matrix) <- gsub("predicted_celltype.score.", "vote_", colnames(voting_matrix))
+head(voting_matrix)
+
+# plot confidence
+p_vln <- VlnPlot(seu.integrated,  features = "atlas_pred_score",
+  group.by = "atlas_pred_celltype", pt.size = 0.1,
+  cols = atlas_palette
+) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Label Transfer Confidence by Cell Type")
+
+ggsave(
+  file.path(Figures, paste("Label_transfer_confidence_", ct, ".pdf", sep="")),
+  plot = p_vln,
+  width = 10, height = 6
+)
+
+# 2. PLOT A: Visualizing atlas labels on your QUERY's native UMAP layout
+p_query_umap <- DimPlot(
+  seu.integrated,
+  reduction = "umap", # Uses your query's own UMAP coordinates
+  group.by = "atlas_pred_celltype",
+  cols = atlas_palette,
+  #label = TRUE,
+  label=F,
+  label.size = 5,
+  repel = TRUE
+) +
+  ggtitle("Query UMAP colored by Atlas Predictions") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_query_umap)
+
+# 3. PLOT B: Visualizing query cells projected onto the REFERENCE UMAP space
+p_projected_umap <- DimPlot(
+  seu.integrated,
+  reduction = "ref.umap", # Uses the reference atlas UMAP coordinates calculated by MapQuery
+  group.by = "atlas_pred_celltype",
+  cols = atlas_palette,
+  #label = TRUE,
+  label=F,
+  label.size = 5,
+  repel = TRUE
+) +
+  ggtitle("Query Cells Projected onto Reference Atlas UMAP") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_projected_umap)
+
+
+# 4. Save both plots cleanly
+ggsave(
+  file.path(Figures, paste("Query_UMAP_with_Atlas_Labels_", ct, ".pdf", sep="")),
+  plot = p_query_umap,
+  width = 10, height = 6
+)
+
+ggsave(
+  file.path(Figures, paste("Query_Projected_onto_Atlas_UMAP_", ct, ".pdf", sep="")),
+  plot = p_projected_umap,
+  width = 10, height = 6
+)
+
+```
+
+
+### Annotate clusters based on reference majority vote
+```{r annotation cluster-wide}
+message("Aggregating cell-level predictions to cluster-level annotations...")
+
+# 1. Generate a cross-tabulation table (Clusters vs. Atlas Predictions)
+cluster_vs_pred <- table(seu.integrated$cluster_type, seu.integrated$atlas_pred_celltype)
+
+cat("\n--- Cross-tabulation Matrix ---\n")
+print(cluster_vs_pred)
+
+# 2. Extract the majority vote for each cluster using dplyr (already in your libraries)
+majority_votes <- as.data.frame(cluster_vs_pred) %>%
+  rename(cluster = Var1, predicted_celltype = Var2, cell_count = Freq) %>%
+  group_by(cluster) %>%
+  # Find the cell type with the highest count in each cluster
+  slice_max(order_by = cell_count, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+
+cat("\n--- Assigned Majority Votes per Cluster ---\n")
+print(majority_votes)
+
+# 3. Map these consensus labels back into the Seurat object metadata
+# Create a named vector for quick mapping
+annotation_vector <- majority_votes$predicted_celltype
+names(annotation_vector) <- majority_votes$cluster
+
+# Assign the new labels to a distinct metadata column so you don't lose original clusters
+seu.integrated$cluster_annotated <- unname(annotation_vector[as.character(seu.integrated$cluster_type)])
+
+# Also set them as the active identities for easy plotting
+Idents(seu.integrated) <- "cluster_annotated"
+
+# 4. Plot the newly annotated clusters on your query layout
+p_cluster_annotated <- DimPlot(
+  seu.integrated, 
+  reduction = "umap", 
+  #label = TRUE, 
+  label = F, 
+  label.size = 5, 
+  repel = TRUE,
+  cols = atlas_palette # Reuses your defined palette
+) + 
+  ggtitle("Query Clusters Annotated by Atlas Majority Vote") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_cluster_annotated)
+
+# 5. Save the clean consensus plot
+ggsave(
+  file.path(Figures, paste("Query_UMAP_Cluster_Annotated_", ct, ".pdf", sep="")), 
+  plot = p_cluster_annotated, 
+  width = 10, height = 6
+)
+
+# Optional: Save the newly annotated object back to your results folder
+# SaveSeuratRds(seu.integrated, file = outfile)
+```
+
+
+
+Annotate by each reference separately
+```{r}
+
+  outfile_new <- file.path(Data_calc, paste("seu_integrated_clusters_newnames_refscores_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+  if (!file.exists(outfile_new)){
+        # 2. Set memory options (as you did before)
+  options(future.globals.maxSize = 50000 * 1024^2)
+  plan("sequential")
+  
+  # 3. Start the loop
+  ref_objects <- list()
+  for (ref_name in names(ref_info)){
+    
+    message(paste("--- Processing Reference:", ref_name, "---"))
+    # check if the anchoring was already done:
+    if (paste0("pred.", ref_name) %in% names(seu.integrated@meta.data)){
+      print("reference already processed and added")
+    } else {
+      ref_file <-  file.path(Data_calc, 
+                      paste0("ref_", ref_name, "_harmonized_transformed_downsampled.rds"))
+      if (file.exists(ref_file)){
+        ref_obj <- LoadSeuratRds(file=ref_file)
+      } else {
+        stop("Reference file does not exist: ", ref_file)
+      }
+      
+      DefaultAssay(ref_obj) <- "RNA"
+      ref_obj <- NormalizeData(ref_obj, verbose = FALSE)
+      ref_obj <- FindVariableFeatures(ref_obj, nfeatures = 2000, verbose = FALSE)
+      ref_obj <- ScaleData(ref_obj, verbose = FALSE)
+      ref_obj <- RunPCA(ref_obj, npcs = 30, verbose = FALSE)
+      
+      # B. Find Anchors
+      anchors <- FindTransferAnchors(
+        reference = ref_obj,
+        query = seu.integrated,
+        #normalization.method = "SCT",
+        normalization.method = "LogNormalize",
+        reference.reduction = "pca",
+        dims = 1:30
+      )
+      
+      # C. Map Query and Transfer Labels
+      # We use the ref_name to create unique metadata columns in your query object
+      seu.integrated <- MapQuery(
+        anchorset = anchors,
+        reference = ref_obj,
+        query = seu.integrated,
+        refdata = list(prediction = "celltype_harmonized"),
+        reference.reduction = "pca", 
+        reduction.model = "umap"
+      )
+      
+      # D. Rename the transferred metadata columns so they don't get overwritten in the next loop
+      # This stores them as "pred.adr", "pred.GOSH", etc.
+      seu.integrated[[paste0("pred.", ref_name)]] <- seu.integrated$predicted.prediction
+      seu.integrated[[paste0("score.", ref_name)]] <- seu.integrated$predicted.prediction.score
+      
+      ref_objects[[ref_name]] <- ref_obj
+      
+      # E. Clean up memory before next dataset
+      rm(ref_obj, anchors)
+      gc()
+    } # end of if/else of processing reference
+    
+  } # enf of loop ref_name in names(ref_info)
+  
+  # new save the new seurat object
+  SaveSeuratRds(seu.integrated, file = outfile_new)
+  } else {
+    seu.integrated <- LoadSeuratRds(outfile_new)
+  }
+  
+  
+  # plot all of them - TO DO - do it automatically
+  cols_to_plot <- paste("pred.", names(ref_info), sep="")
+  
+  # calculate confidence of each score:
+  summary_list <- list()
+  for (ref in cols_to_plot) {
+    rscore <- gsub("pred.", "score.", ref)
+    rqual <- gsub("score.", "qual.", rscore)
+    seu.integrated[[rqual]] <- ifelse(
+    seu.integrated[[rscore]] >= 0.5, 
+    "High (>0.5)", 
+    "Low (<0.5)"
+       )
+    
+    # p_scvi <- DimPlot(seu.integrated,
+    #                   reduction = "umap",
+    #                   group.by = ref,
+    #                   split.by = rqual,
+    #                   label = TRUE,
+    #                   repel = TRUE) +
+    #   ggtitle(paste("SCVI UMAP: ",ref, " Labels",sep=""))
+    # print(p_scvi)
+    
+  counts <- table(seu.integrated[[rqual]])
+  percent <- round(100 * prop.table(counts), 2)
+
+  summary_list[[ref]] <- data.frame(
+    Classification = names(counts),
+    Count = as.numeric(counts),
+    Percentage = as.numeric(percent)
+  )  
+}
+  
+  # 2. Create a list of plots
+  plot_list <- list()
+  for (ref in cols_to_plot) {
+    print(ref)
+    print(table(seu.integrated[[ref]]))
+    rscore <- gsub("pred.", "score.", ref)
+    rqual <- gsub("score.", "qual.", rscore)
+    # replace label of low quality plots
+    ref_vector    <- seu.integrated[[ref]][, 1]
+    rscore_vector <- seu.integrated[[rscore]][, 1]
+    seu.integrated[[ref]] <- ifelse(rscore_vector >= 0.5, ref_vector, "low (<0.5)")
+    print(table(seu.integrated[[ref]]))
+    # Check if the column exists to avoid errors
+    if (ref %in% colnames(seu.integrated@meta.data)) {
+      
+      p <- DimPlot(seu.integrated, 
+                   reduction = "umap", 
+                   group.by = ref, 
+                  cols = atlas_palette,
+                   # split.by = rqual,
+                   label = F, 
+                   label.size = 6, 
+                   repel = TRUE) + 
+        ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
+        # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+      
+      plot_list[[ref]] <- p
+      # also save
+      ggsave(file.path(Figures, paste("Dimplot_ref_", ref, "_", ct,
+                    "_all_nHVG", nHVG_str,".pdf", sep="")), p, width = 10,   height = 6)
+    } # end of if
+  } # loop for different reference data
+  
+  # repeat loop for reference data with different days
+  day_options <- c("D26_both", "D42_both", "D26_WT", "D26_STOP_MYCN",
+                   "D42_novirus", "D42_hTH", "all")
+
+  for (day in day_options){
+      seu.day <- subset_seu_by_day(seu.integrated, day)
+    
+      # drop unused levels - do it everywhere!!!
+      cluster_sizes <- table(seu.day$cluster_type)
+      keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+      seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+      if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+        seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+      }
+    
+      # set up the order
+      bio_order <- bio_order_list[[ct]]
+      seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+   
+      # use new names
+      actual_day <- limma::strsplit2(day, "_")[[1]]
+      
+      # Rename clusters from previous annotation
+      if (actual_day %in% names(cluster_names_dict[[ct]])){
+            new_cluster_ids <- dplyr::recode(
+          as.character(seu.day$cluster_type),
+          !!!cluster_names_dict[[ct]][[actual_day]]
+        )
+        # Preserve cluster order
+        renamed_cluster_order <- unique(dplyr::recode(
+          bio_order,
+          !!!cluster_names_dict[[ct]][[actual_day]]
+        ))
+        
+        new_cluster_ids <- factor(
+          new_cluster_ids,
+          levels = renamed_cluster_order
+        )
+        
+        # Store back into Seurat object and construct final legend text
+        seu.day$cluster_type_renamed <- new_cluster_ids
+        Idents(seu.day) <- "cluster_type_renamed"
+      }
+      
+      # drop unused levels
+      seu.day$cluster_type_renamed <- droplevels(seu.day$cluster_type_renamed)
+      print(table(seu.day$cluster_type_renamed))
+        
+      # Print out
+      cat("\nProcessing Day:", day, "\n")
+      print(table(seu.day$sample.names))
+      
+      # now the loop for different reference types
+      for (ref in cols_to_plot) {
+        print(ref)
+        print(table(seu.day[[ref]]))
+        rscore <- gsub("pred.", "score.", ref)
+        rqual <- gsub("score.", "qual.", rscore)
+        # replace label of low quality plots
+        ref_vector    <- seu.day[[ref]][, 1]
+        rscore_vector <- seu.day[[rscore]][, 1]
+        seu.day[[ref]] <- ifelse(rscore_vector >= 0.5, ref_vector, "low (<0.5)")
+        print(table(seu.day[[ref]]))
+        # Check if the column exists to avoid errors
+        if (ref %in% colnames(seu.day@meta.data)) {
+          
+          p <- DimPlot(seu.day, 
+                       reduction = "umap", 
+                       group.by = ref, 
+                      cols = atlas_palette,
+                       # split.by = rqual,
+                       label = F, 
+                       label.size = 6, 
+                       repel = TRUE) + 
+            ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
+            # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
+            theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+          
+          plot_list[[ref]] <- p
+          # also save
+          ggsave(file.path(Figures, paste("Dimplot_ref_", ref, "_", ct,
+                "_day_", day, "_nHVG", nHVG_str,".pdf", sep="")), p, width = 10,   height = 6)
+        } # end of if
+      } # loop for different reference data
+      
+  }
+  
+
+  
+  
 #} # loop for celltype
 
 ```
 
 
-# ```{r test}
-# ref_obj <- ref_objects[["GOSH"]]
-#     Idents(ref_obj) <- "risk"
-#           
-#     # B. Find Anchors
-#     anchors <- FindTransferAnchors(
-#     reference = ref_obj,
-#     query = seu.integrated,
-#     normalization.method = "SCT",
-#     reference.reduction = "pca",
-#     dims = 1:30)
-#       
-#     # C. Map Query and Transfer Labels
-#     # We use the ref_name to create unique metadata columns in your query object
-#     seu.integrated <- MapQuery(
-#       anchorset = anchors,
-#       reference = ref_obj,
-#       query = seu.integrated,
-#       refdata = list(prediction = "risk"),
-#       reference.reduction = "pca", 
-#       reduction.model = "umap"
-#     )
-#       
-#     # D. Rename the transferred metadata columns so they don't get overwritten in the next loop
-#     # This stores them as "pred.adr", "pred.GOSH", etc.
-#     seu.integrated[[paste0("pred.", "GOSH.risk")]] <- seu.integrated$predicted.prediction
-#     seu.integrated[[paste0("score.", "GOSH.risk")]] <- seu.integrated$predicted.prediction.score
-#       
-#     plot_list <- list()
-#     for (ref in c("pred.GOSH.risk")){
-#       print(ref)
-#       rscore <- paste0("pred.", "GOSH.risk")
-#       scrqual <- paste0("score.", "GOSH.risk")
-#       # Check if the column exists to avoid errors
-#       if (ref %in% colnames(seu.integrated@meta.data)) {
-#         
-#         p <- DimPlot(seu.integrated, 
-#                      reduction = "umap", 
-#                      group.by = ref, 
-#                      split.by = rqual,
-#                      label = TRUE, 
-#                      label.size = 6, 
-#                      repel = TRUE) + 
-#           ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
-#           # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
-#           theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-#         plot(p)
-#       }
-#     }
-#     
-#     
-#     #----------------------
-#     # 4. Plot for specific clusters on specific days
-#     day <- "D42_hTH"
-#     seu.day <- switch(day,
-#       "D26_both" = {
-#         subset(seu.integrated, subset = sample.names %in% 
-#                  grep(paste0(gsub("_both", "", day), "$"), unique(sample.names), value = TRUE))
-#       },
-#       "D42_both" = {
-#         subset(seu.integrated, subset = sample.names %in% 
-#                  grep(gsub("_both", "", day), unique(sample.names), value = TRUE))
-#       },
-#       "D26_WT" = {
-#         subset(seu.integrated, subset = sample.names %in% 
-#                  grep(paste0("MIX_", gsub("_WT", "", day), "$"), unique(sample.names), value = TRUE))
-#       },
-#       "D26_STOP_MYCN" = {
-#         subset(seu.integrated, subset = sample.names %in% 
-#                  grep(paste0("MYCN_", gsub("_STOP_MYCN", "", day), "$"), unique(sample.names), value = TRUE))
-#       },
-#       "D42_novirus" = {
-#         subset(seu.integrated, subset = sample.names %in% 
-#                  grep(paste0("MYCN_", gsub("_novirus", "", day), "$"), unique(sample.names), value = TRUE))
-#       },
-#       "all" = {
-#         # Logic for 'all'
-#         seu.integrated 
-#       },
-#       "healthy" = {
-#         subset(seu.integrated, subset = !sample.names %in% grep("hTH", unique(sample.names), value = T))
-#       },
-#       # Default case (for D26, D42, D42_hTH, etc.)
-#       {
-#         subset(seu.integrated, subset = sample.names %in% grep(paste0(day, "$"), unique(sample.names), value = TRUE))
-#       })
-#       
-#     # drop unused levels - do it everywhere!!!
-#       cluster_sizes <- table(seu.day$cluster_type)
-#       keep_clusters <- names(cluster_sizes[cluster_sizes >= 10])
-#       seu.day <- subset(
-#       seu.day, subset = cluster_type %in% keep_clusters)
-#       seu.day$cluster_type <- droplevels(seu.day$cluster_type)
-#       
-#       
-#     # also pick one cluster
-#     # table(seu.day$cluster_type_renamed_D42_hTH)
-#     sel_ident_str <- paste("cluster_type_renamed", day, sep="_")
-#     sel_ident_sym <- sym(sel_ident_str)
-#     sel_clus <- c("EGFP tumor", "EGFP MES")
-#     sel_clus_str <- gsub(" ", "_", sel_clus)
-#     seu.clus <- subset(seu.day, subset = !!sel_ident_sym %in% sel_clus)
-#     #seu.clus[[sel_ident_str]] <- droplevels(seu.clus[[sel_ident_str]])
-#     seu.clus@meta.data <- droplevels(seu.clus@meta.data) # drop unused levels everywhere
-#     
-#     # now predict
-#     ref_obj <- ref_objects[["GOSH"]]
-#     Idents(ref_obj) <- "risk"
-#           
-#     # B. Find Anchors
-#     anchors <- FindTransferAnchors(
-#     reference = ref_obj,
-#     query = seu.clus,
-#     normalization.method = "SCT",
-#     reference.reduction = "pca",
-#     dims = 1:30)
-#       
-#     # C. Map Query and Transfer Labels
-#     # We use the ref_name to create unique metadata columns in your query object
-#     seu.clus <- MapQuery(
-#       anchorset = anchors,
-#       reference = ref_obj,
-#       query = seu.clus,
-#       refdata = list(prediction = "risk"),
-#       reference.reduction = "pca", 
-#       reduction.model = "umap"
-#     )
-#       
-#     # D. Rename the transferred metadata columns so they don't get overwritten in the next loop
-#     # This stores them as "pred.adr", "pred.GOSH", etc.
-#     seu.clus[[paste0("pred.", "GOSH.risk")]] <- seu.clus$predicted.prediction
-#     seu.clus[[paste0("score.", "GOSH.risk")]] <- seu.clus$predicted.prediction.score
-#       
-#     plot_list <- list()
-#     for (ref in c("pred.GOSH.risk")){
-#       print(ref)
-#       rscore <- paste0("pred.", "GOSH.risk")
-#       scrqual <- paste0("score.", "GOSH.risk")
-#       # Check if the column exists to avoid errors
-#       if (ref %in% colnames(seu.clus@meta.data)) {
-#         
-#         p <- DimPlot(seu.clus, 
-#                      reduction = "umap", 
-#                      group.by = ref, 
-#                      split.by = rqual,
-#                      label = TRUE, 
-#                      label.size = 6, 
-#                      repel = TRUE) + 
-#           ggtitle(paste("Reference:", gsub("pred.", "", ref))) +
-#           # NoLegend() + # Removing legends to keep it clean; labels are on the clusters
-#           theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-#         plot(p)
-#       }
-#     }
-#     
-# 
-# ```
-# 
+
+Session info for reproducibility - run once after all rmd files had been run
+```{r session info}
+sessionInfo()
+```
 
 

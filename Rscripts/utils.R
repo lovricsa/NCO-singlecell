@@ -196,53 +196,122 @@ subset_seu_by_day <- function(seu_obj, day) {
 
 
 # Helper function to add minimalist corner axes to any Seurat plot
-add_corner_axes <- function(plot_obj, arrow_length = 0.20, margin_offset = 0.02, text_offset = 0.03) {
+add_corner_axes <- function(plot_obj, arrow_length = 0.12, margin_offset = 0.07) {
   
-  # 1. Dynamically extract dimension names (works for UMAP, t-SNE, or PCA)
-  dims <- colnames(plot_obj$data)[1:2]
+  if (!requireNamespace("cowplot", quietly = TRUE)) {
+    install.packages("cowplot")
+  }
   
-  # 2. Get coordinates to find the plot boundaries
-  x_vals <- plot_obj$data[[dims[1]]]
-  y_vals <- plot_obj$data[[dims[2]]]
+  # 1. Dynamically extract dimension names from the data
+  all_cols <- colnames(plot_obj$data)
+  dims <- all_cols[grepl("umap|tsne|pca", all_cols, ignore.case = TRUE)][1:2]
   
-  x_min <- min(x_vals); x_max <- max(x_vals); x_range <- x_max - x_min
-  y_min <- min(y_vals); y_max <- max(y_vals); y_range <- y_max - y_min
-  
-  # 3. Define the origin point for the new corner axes (shifted slightly from absolute min)
-  start_x <- x_min + (x_range * margin_offset)
-  start_y <- y_min + (y_range * margin_offset)
-  
-  # Define how long the custom axis arrows should be
-  len_x <- x_range * arrow_length
-  len_y <- y_range * arrow_length
-  
-  # Clean up labels for display (e.g., "umap_1" becomes "UMAP 1")
   label_x <- toupper(gsub("_", " ", dims[1]))
   label_y <- toupper(gsub("_", " ", dims[2]))
   
-  # 4. Remove original axes and layer on custom corner arrows
-  plot_obj + 
+  # 2. Strip the original axes cleanly
+  p_stripped <- plot_obj + 
     theme(
+      panel.border = element_blank(),
+      panel.background = element_blank(),
+      plot.background = element_blank(),
       axis.line = element_blank(),
       axis.text = element_blank(),
       axis.ticks = element_blank(),
       axis.title = element_blank(),
-      panel.grid = element_blank()
-    ) +
+      panel.grid = element_blank(),
+      # Push the cell cloud slightly away from the bottom-left corner
+      plot.margin = margin(t = 5, r = 5, b = 20, l = 20, unit = "pt")
+    )
+  
+  # 3. Use absolute canvas coordinates (0 to 1) to draw the axes permanently
+  # This guarantees they never get clipped or overridden!
+  cowplot::ggdraw(p_stripped) +
     # Custom X-Axis Arrow
-    annotate("segment", x = start_x, xend = start_x + len_x, y = start_y, yend = start_y,
-             arrow = arrow(length = unit(0.12, "cm"), type = "closed"), linewidth = 0.6, color = "black") +
+    cowplot::draw_line(
+      x = c(margin_offset, margin_offset + arrow_length), 
+      y = c(margin_offset, margin_offset),
+      arrow = arrow(length = unit(0.10, "cm"), type = "closed"), 
+      linewidth = 0.6, color = "black"
+    ) +
     # Custom Y-Axis Arrow
-    annotate("segment", x = start_x, xend = start_x, y = start_y, yend = start_y + len_y,
-             arrow = arrow(length = unit(0.12, "cm"), type = "closed"), linewidth = 0.6, color = "black") +
-    # Custom X Label
-    annotate("text", x = start_x + (len_x / 2), y = start_y - (y_range * text_offset), 
-             label = label_x, size = 3, vjust = 1, hjust = 0.5, fontface = "bold") +
-    # Custom Y Label
-    annotate("text", x = start_x - (x_range * text_offset), y = start_y + (len_y / 2), 
-             label = label_y, size = 3, vjust = 0.5, hjust = 0.5, angle = 90, fontface = "bold")
+    cowplot::draw_line(
+      x = c(margin_offset, margin_offset), 
+      y = c(margin_offset, margin_offset + arrow_length),
+      arrow = arrow(length = unit(0.10, "cm"), type = "closed"), 
+      linewidth = 0.6, color = "black"
+    ) +
+    # Custom X Label (Placed cleanly below the X arrow)
+    cowplot::draw_label(
+      label_x, 
+      x = margin_offset + (arrow_length / 2), 
+      y = margin_offset - 0.03, 
+      size = 8, fontface = "bold", hjust = 0.5, vjust = 1
+    ) +
+    # Custom Y Label (Placed cleanly to the left of the Y arrow)
+    cowplot::draw_label(
+      label_y, 
+      x = margin_offset - 0.03, 
+      y = margin_offset + (arrow_length / 2), 
+      size = 8, fontface = "bold", hjust = 0.5, vjust = 0.5, angle = 90
+    )
 }
 
-recode_labels <- function(x, map) {
-  dplyr::recode(x, !!!map, .default = "unknown")
+clean_and_flatten_list <- function(input_list, valid_genes) {
+  cleaned <- lapply(input_list, function(x) intersect(x, valid_genes))
+  gene_all <- c()
+  flat_list <- cleaned
+  for (mname in names(flat_list)){
+    flat_list[[mname]] <- setdiff(flat_list[[mname]], gene_all)
+    gene_all <- union(gene_all, flat_list[[mname]])
+  }
+  return(flat_list)
+}
+
+# recode_labels <- function(x, mapping) {
+#   # 1. Save the original cell barcodes (vector names)
+#   cell_barcodes <- names(x)
+#   
+#   # 2. Convert the factor to a standard character vector
+#   x_char <- as.character(x)
+#   
+#   # 3. Perform the named mapping look-up
+#   replaced <- mapping[x_char]
+#   
+#   # 4. Fallback: If a cell type wasn't in your mapping, label it as "unknown"
+#   idx_unmapped <- is.na(replaced)
+#   replaced[idx_unmapped] <- "unknown"
+#   
+#   # 5. Restore the original cell barcodes as vector names
+#   names(replaced) <- cell_barcodes
+#   
+#   return(replaced)
+# }
+
+recode_labels <- function(x, mapping, fallback = "keep") {
+  if (is.data.frame(x)) {
+    x_vec <- x[[1]]
+    names(x_vec) <- rownames(x)
+    x <- x_vec
+  }
+  
+  cell_barcodes <- names(x)
+  
+  x_char <- as.character(x)
+  
+  replaced <- mapping[x_char]
+  
+  idx_unmapped <- is.na(replaced)
+  
+  if (any(idx_unmapped)) {
+    if (fallback == "keep") {
+      replaced[idx_unmapped] <- x_char[idx_unmapped]
+    } else {
+      replaced[idx_unmapped] <- fallback
+    }
+  }
+  
+  names(replaced) <- cell_barcodes
+  
+  return(factor(replaced))
 }

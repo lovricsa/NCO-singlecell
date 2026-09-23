@@ -26,36 +26,17 @@ The objective of this R Markdown code is to analyse the results obtained by the 
 
 ```{r libraries, message=FALSE, warning=FALSE}
 knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
-# # install CRAN packages via BioConductor as well
-# if (!"BiocManager" %in% installed.packages()[,"Package"]){
-#   install.packages("BiocManager")
-# }
-# list.of.packages <- c("ggplot2", "ComplexHeatmap", "tidyHeatmap", 
-#                       "circlize", "limma", "edgeR", "dplyr", "tidyr",
-#                       "UpSetR", "ComplexUpset", "VennDiagram", "readr", "openxlsx", "readxl", 
-#                       "ggmagnify", "readr", "ggrepel")
-# new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
-# if(length(new.packages)) BiocManager::install(new.packages)
-
-suppressPackageStartupMessages({
-  library(Seurat)
-  library(SeuratObject)
-  library(DoubletFinder) # for doublet detection
-  library(scDblFinder) # a newer doublet detection tool
-  library(SeuratWrappers)
-  library(glmGamPoi)
-  library(monocle3)
-  library(ggplot2)
-  library(patchwork) # to combine plots
-  library(Matrix)
-  library(dplyr)
-  library(tidyr)
-  library(here)
-  library(stringr) # for the string replacements
-  library(future) # for parallel Seurat runs
-  library(clustree) # to visualize clusters
-  library(biomaRt) # to convert ensembl id-s
-})
+packages <- c(
+  "Seurat",
+  "SeuratObject",
+  "scDblFinder",
+  "ggplot2",
+  "patchwork",
+  "dplyr",
+  "tidyr",
+  "here"
+)
+invisible(lapply(packages, library, character.only = TRUE))
 ```
 
 
@@ -110,7 +91,6 @@ proper_names <- c("1_EpiC_MIX_D26",
 data.list <- list()
 seu.list <- list()
 
-# HIGHLIGHTED FIX: Extracts realpath dependencies cleanly through Symlinks via ReadMtx
 for (si in 1:length(prefixes)){
   mtx_file  <- file.path(countfolder, paste0(prefixes[si], "_matrix.mtx.gz"))
   cells_file <- file.path(countfolder, paste0(prefixes[si], "_barcodes.tsv.gz"))
@@ -209,7 +189,7 @@ md_new <- seu@meta.data %>%
   summarise(
     mad_min_feat = median(nFeature_RNA) - (3 * mad(nFeature_RNA)),
     mad_max_mito = median(percent.mito) + (3 * mad(percent.mito)),
-    quant_max_feat = quantile(nFeature_RNA, 0.99),
+    quant_max_feat = quantile(nFeature_RNA, 0.99), # consider removing this, since doublets are removed anyway
     .groups = "drop"
   )
 
@@ -227,7 +207,7 @@ print(sbounds)
 # Sometimes 3 MADs can be too aggressive; we set absolute floors/ceilings
 seu$final_min_feat <- pmax(seu$mad_min_feat, 200) # Never lower than 200
 seu$final_max_feat <- seu$quant_max_feat # if the distribution has a long tail, this should work -> check visually!
-seu$final_max_mito <- pmin(seu$mad_max_mito, 20)  # Never higher than 15%
+seu$final_max_mito <- pmin(seu$mad_max_mito, 20)  # threshold chosen based on manual inspection
 
 # before the actual filtering, create plots
 for (sname in unique(seu@meta.data$sample.names)) {
@@ -463,24 +443,24 @@ if (file.exists(outfile)){
          subtitle = paste("Current Prior Rate:", dbrate),
          x = "scDblFinder Score", y = "Cell Count") +
     facet_wrap(~sample.names, ncol=2)
-    plot(p)
-    outfig <- file.path(Figures, paste("doublet_score_distribution_dbrate", 
+  plot(p)
+  outfig <- file.path(Figures, paste("doublet_score_distribution_dbrate", 
                           as.character(round(dbrate, digits=3)), ".pdf", sep=""))
-    ggsave(outfig, plot=p, width=10, height = 10) 
+  ggsave(outfig, plot=p, width=10, height = 10) 
   
   # Calculate observed rate
-    calc_dbrate <- mean(doublet_stats$percent) / 100
-    ratio <- if(dbrate > 0) calc_dbrate / dbrate else 0
+  calc_dbrate <- mean(doublet_stats$percent) / 100
+  ratio <- if(dbrate > 0) calc_dbrate / dbrate else 0
     
     
-    # log iteration history
-    iteration_history <- rbind(iteration_history, data.frame(
+  # log iteration history
+  iteration_history <- rbind(iteration_history, data.frame(
     iteration = iter,
     prior_rate = dbrate,
     observed_rate = calc_dbrate))
     
     
-    if (ratio > 0.8 && ratio < 1.2){ 
+  if (ratio > 0.8 && ratio < 1.2){ 
       dbrateok <- TRUE
       print(paste("Observed rate was", round(calc_dbrate, 4), "- convergence reached."))
     } else {
@@ -551,7 +531,7 @@ if (file.exists(outfile)){
     
     sobj <- FindNeighbors(object = sobj, dims = 1:selected_dims, verbose=F)
     sobj <- FindClusters(object = sobj, verbose=F) # unnecessary here
-    sobj <- RunUMAP(object = sobj, dims = 1:1:selected_dims, verbose=F)
+    sobj <- RunUMAP(object = sobj, dims = 1:selected_dims, verbose=F)
     # save for later plots
     umap_coords <- as.data.frame(Embeddings(sobj, reduction = "umap"))
     colnames(umap_coords) <- c("UMAP_1_sample", "UMAP_2_sample")
@@ -571,7 +551,7 @@ if (file.exists(outfile)){
     sex.expr <- FetchData(sobj, vars = c("XIST", "KDM5D", "RPS4Y1")) # check ambient RNA - typically 1-2 UMI
     xxy.cells <- rownames(sex.expr)[
       sex.expr$XIST > 1 &
-        (sex.expr$KDM5D > 1 | sex.expr$RPS4Y1 > 1)]
+        (sex.expr$KDM5D > 1 | sex.expr$RPS4Y1 > 1)] # empirically chosen threshold
     xxy_status <- ifelse(colnames(sobj) %in% xxy.cells, "XXY", "Normal")
     names(xxy_status) <- colnames(sobj)
     #mdadd[[sname]] <- as.data.frame(xxy_status)
@@ -789,7 +769,8 @@ cell_counts_table <- rna_data %>%
     percent_both = 100 * n_both / n_cells
   )
 
-print(cell_counts_table) # print out nicely for knitted html
+# print(cell_counts_table) # print out nicely for knitted html
+knitr::kable(cell_counts_table, caption = "Transgene Detection Rates per Sample")
 ```
 
 

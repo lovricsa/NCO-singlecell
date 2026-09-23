@@ -1,0 +1,927 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 3 - selected resolutions"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the organoid single cell RNA sequencing.
+
+```{r libraries}
+
+packages <- c(
+  "Seurat",
+  "ggplot2",
+  "patchwork",    
+  "Matrix",
+  "dplyr",
+  "here",
+  "stringr",      
+  "future",       
+  "clustree",     
+  "RColorBrewer",
+  "ggforce",
+  "concaveman",
+  "openxlsx",
+  "viridis",      
+  "msigdbr"   
+)
+invisible(lapply(packages, library, character.only = TRUE))
+
+```
+
+
+<!-- # Biztosan kellene sejt -->
+<!-- # populáció/cluster azonosítás marker gének alapján, pseudotime analízis -->
+<!-- # és CellChat vagy CellPhoneDB analízis is -> do CellChat: https://github.com/jinworks/CellChat1 -->
+
+Folder structure is defined first
+```{r}
+Datafolder     <- here("Data")
+# Subdirectories specifically isolated for this run's outputs
+Figures   <- here(file.path("Figures", "selected_resolution"))
+Figures_dimplots <- file.path(Figures, "dimplots")
+Data_calc <- here("Data_calculated")
+Results   <- here("Results")
+
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Figures_dimplots))   dir.create(Figures_dimplots, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+
+utils_file <- here("Rscripts","utils.R")
+if (file.exists(utils_file)) source(utils_file)
+```
+
+
+Config parameters and marker lists
+```{r}
+config_file <- here("Rscripts","config.R")
+source(config_file)
+
+# Select cell line
+ct <- "EpiC"
+# ct <- "kolf2"
+```
+
+
+# Integrated UMAP Visualizations
+Below are the UMAP plots for the integrated cell line specific data, split by sample name. Convex hulls are included to better delineate the clusters. 
+```{r EpiC-UMAP-Visualizations, fig.width=15, fig.height=10}
+
+outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
+seu.integrated <- LoadSeuratRds(file=outfile)
+
+# for the nice plots, remove "type_12" cluster
+seu.integrated <- subset(seu.integrated, subset = !cluster_type %in% c("type_12"))
+seu.integrated$cluster_type <- droplevels(seu.integrated$cluster_type)
+
+#DimPlot(seu.integrated)
+table(seu.integrated$sample.names, seu.integrated$cluster_type)
+
+# to plot van-Haver markers:
+# add hulls
+my_hulls <- get_glasswork_layers(
+    seu.integrated,
+    clusvar = "cluster_type",
+    concavity = 4,         # Slightly higher concavity follows the dense core better
+    core_quantile = 0.80   # This ignores the 20% most isolated cells
+  )
+names(my_hulls) <- sort(unique(seu.integrated$cluster_type))
+
+my_hulls_outline <- get_glasswork_layers_outline(
+    seu.integrated,
+    clusvar = "cluster_type",
+    concavity = 3,         # Slightly higher concavity follows the dense core better
+    core_quantile = 0.75   # This ignores the 25% most isolated cells
+  )
+
+# Calculate percentages for each sample
+cluster_num <- table(seu.integrated$cluster_type, seu.integrated$sample.names)
+cluster_perc <- round(prop.table(cluster_num, margin = 2) * 100, digits=2)
+
+# Calculate coordinates for labels
+umap_coords <- seu.integrated@reductions$umap@cell.embeddings
+label_coords <- umap_coords %>% as.data.frame() %>%
+  mutate(
+    cluster_type = seu.integrated$cluster_type,
+  ) %>%
+  group_by(cluster_type) %>%
+  summarize(umap_1 = median(umap_1), umap_2 = median(umap_2), .groups = "drop")
+
+label_coords_num <- umap_coords %>% as.data.frame() %>%
+  mutate(
+    cluster_num = unlist(seu.integrated[[selres]])
+  ) %>%
+  group_by(cluster_num) %>%
+  summarize(umap_1 = median(umap_1), umap_2 = median(umap_2), .groups = "drop")
+
+```
+
+# Integrated UMAP for each day
+
+```{r UMAP for each day}
+
+  day_options <- c("D26_WT", "D26_STOP_MYCN", "D42_novirus", "D42_hTH")
+
+  for (day in day_options){
+    seu.day <- subset_seu_by_day(seu.integrated, day)
+        
+    # drop unused levels - do it everywhere!!!
+      cluster_sizes <- table(seu.day$cluster_type)
+      keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+      seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+      if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+        seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+      }
+      seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+      
+      seu.day$num_id <- seu.day[[selres]]
+      seu.day$num_id <- droplevels(seu.day$num_id)
+      
+      # add num_id order; TO DO later: num_id_final - take into account that some clusters appear in earlier days first
+      actual_numbers <- as.numeric(as.character(unique(seu.day$num_id)))
+      sorted_numeric_levels <- as.character(sort(actual_numbers))
+      seu.day$num_id <- factor(seu.day$num_id, levels = sorted_numeric_levels)
+        
+      # print(day)
+      # print(table(seu.day$sample.names))
+          
+      # use new names
+      actual_day <- limma::strsplit2(day, "_")[[1]]
+      
+      # Rename clusters from previous annotation
+      if (actual_day %in% names(cluster_names_dict[[ct]])){
+          new_cluster_ids <- dplyr::recode(
+          as.character(seu.day$cluster_type),
+          !!!cluster_names_dict[[ct]][[actual_day]]
+        )
+        # Preserve cluster order
+        renamed_cluster_order <- unique(dplyr::recode(
+          bio_order,
+          !!!cluster_names_dict[[ct]][[actual_day]]
+        ))
+        
+        new_cluster_ids <- factor(
+          new_cluster_ids,
+          levels = unique(renamed_cluster_order)
+        )
+        
+        # Store back into Seurat object and construct final legend text
+        seu.day$cluster_type_renamed <- new_cluster_ids
+        Idents(seu.day) <- "cluster_type_renamed"
+        seu.day$legend_label <- paste0(seu.day$num_id, ": ", seu.day$cluster_type_renamed)
+      } else {
+          new_cluster_ids <- seu.day$cluster_type
+          renamed_cluster_order <- bio_order
+          # Store back into Seurat object and construct final legend text
+          seu.day$cluster_type_renamed <- new_cluster_ids
+          Idents(seu.day) <- "cluster_type_renamed"
+          seu.day$legend_label <- paste0(seu.day$num_id, ": ", seu.day$cluster_type_renamed)
+      }
+  
+      # add back to original seurat object (for missing cells, it will be NA) - this is not actually used after all
+      meta_names <- c("cluster_type", "legend_label", "num_id", "cluster_type_renamed")
+      meta_colnames <- paste(meta_names, 
+                         day, sep="_")
+      # this is only used in this script and not later - remove?
+      meta_toadd <- data.frame(
+        seu.day@meta.data[, meta_names],
+        row.names = colnames(seu.day)
+      )
+      colnames(meta_toadd) <- meta_colnames
+      seu.integrated <- AddMetaData(
+        seu.integrated,
+        metadata = meta_toadd
+      )
+  
+      
+      # ==========================================
+      # 1. CREATE A DUAL-KEY PALETTE FOR TODAY
+      # ==========================================
+      day_mapping <- unique(as.data.frame(seu.day@meta.data[, c("cluster_type", "legend_label")]))
+      
+      existing_bio_order <- bio_order[bio_order %in% day_mapping$cluster_type]
+      day_mapping <- day_mapping[match(existing_bio_order, day_mapping$cluster_type), ]
+      # use same order as in previous figures
+      numeric_levels <- stringr::str_sort(unique(day_mapping$legend_label), numeric = TRUE)
+      seu.day$legend_label <- factor(seu.day$legend_label, levels = numeric_levels)
+      #seu.day$legend_label <- factor(seu.day$legend_label, levels = day_mapping$legend_label)
+      
+      # Colours for the biological cluster names
+      palette_old <- cluster_palette[as.character(day_mapping$cluster_type)]
+      names(palette_old) <- as.character(day_mapping$cluster_type)
+      
+      # Same colours, but named by the legend labels
+      palette_new <- cluster_palette[as.character(day_mapping$cluster_type)]
+      names(palette_new) <- as.character(day_mapping$legend_label)
+      
+      day_universal_palette <- c(palette_old, palette_new)
+      day_universal_palette <- day_universal_palette[!duplicated(names(day_universal_palette))]
+      
+      # remove unused hulls
+      my_hulls_day <- my_hulls[unique(as.character(seu.day$cluster_type))]
+      # drop unused levels
+      my_hulls_day <- my_hulls_day[!sapply(my_hulls_day, is.null)]
+      
+      # ==========================================
+      # 1.6 FILTER THE NUMBER LABELS FOR TODAY
+      # ==========================================
+      # Filter the coordinate dataframe so it only keeps clusters present in seu.day
+      label_coords_day <- label_coords_num[label_coords_num$cluster_num %in% unique(seu.day$num_id), ]
+      
+      # ==========================================
+      # 2. PLOT WITH SYNCHRONIZED COLORSETS
+      # ==========================================
+      p_orig <- DimPlot(
+          seu.day,
+          cols = day_universal_palette,      # Maps dots using legend_label keys
+          ncol = 2, 
+          label = FALSE, 
+          reduction = "umap",
+          group.by = "legend_label",
+          split.by  = "sample_names_renamed"
+          #pt.size   = 0.1
+          ) +
+          my_hulls_day +                         # OMITTED the forced aes() line here!
+          scale_fill_manual(values = day_universal_palette) +  # Maps hulls using cluster_type keys
+          scale_color_manual(values = day_universal_palette) + # Maps hull borders if needed
+          theme_void() + 
+          theme(
+            #legend.position = "top",
+            legend.position = "right",
+            legend.text = element_text(size = 12),
+            strip.text = element_text(size = 14, face = "bold", margin = margin(b = 10)),
+            plot.title = element_blank()
+          ) +
+          guides(
+            fill = "none", 
+            color = guide_legend(override.aes = list(alpha = 1, size = 4), ncol = 1)
+          ) + 
+          geom_text(
+            data = label_coords_day, 
+            mapping = aes(x = umap_1, y = umap_2, label = cluster_num),
+            size = 8,
+            inherit.aes = FALSE
+          )
+    
+      print(p_orig)
+      
+      outfig <- file.path(Figures, paste("clusters_samples_newnames_", ct, "_res_", 
+              selres, "_day_", day, "_nHVG", nHVG_str, ".pdf", sep=""))
+      ggsave(outfig, plot=p_orig, width=8*length(unique(seu.day$sample.names)), height=8)
+      ggsave(outfig, plot=p_orig, width=10*length(unique(seu.day$sample.names)), height=6)
+      
+      # plot with smaller hulls
+      # 2 options to draw the hulls
+      my_hulls_day <- get_glasswork_layers(
+        seu.day,
+        clusvar = "cluster_type",
+        concavity = 4,         # Slightly higher concavity follows the dense core better
+        core_quantile = 0.80   # This ignores the 20% most isolated cells
+      )
+
+      p_orig <- DimPlot(
+          seu.day,
+          cols = day_universal_palette,      # Maps dots using legend_label keys
+          ncol = 2,
+          label = FALSE,
+          reduction = "umap",
+          group.by = "legend_label",
+          split.by  = "sample_names_renamed",
+          pt.size   = 0.1) +
+          my_hulls_day +                         # OMITTED the forced aes() line here!
+          scale_fill_manual(values = day_universal_palette) +  # Maps hulls using cluster_type keys
+          scale_color_manual(values = day_universal_palette) + # Maps hull borders if needed
+          theme_void() +
+          theme(
+            legend.position = "right",
+            legend.text = element_text(size = 12),
+            strip.text = element_text(size = 14, face = "bold", margin = margin(b = 10)),
+            plot.title = element_blank()
+          ) +
+          guides(
+            fill = "none",
+            color = guide_legend(override.aes = list(alpha = 1, size = 4), ncol = 1)
+          ) +
+          geom_text(
+            data = label_coords_day,
+            mapping = aes(x = umap_1, y = umap_2, label = cluster_num),
+            size = 8,
+            inherit.aes = FALSE
+          )
+
+      print(p_orig)
+
+      outfig <- file.path(Figures, paste("clusters_samples_newnames_smallhulls_", ct, "_res_",
+              selres, "_day_", day, "_nHVG", nHVG_str, ".pdf", sep=""))
+      #ggsave(outfig, plot=p_orig, width=12, height=12)
+      ggsave(outfig, plot=p_orig, width=10*length(unique(seu.day$sample.names)), height=6)
+      
+  }
+
+```
+
+# Cluster Ordering and Proportions
+This section defines the biological ordering of clusters for all subsequent plots and visualizes the cluster distribution across samples using barplots.
+Also plot cell cycle scores, mito.percent, stress score and violin plots
+
+```{r EpiC-Ordering-Proportions}
+
+day_options <- c("D26_both", "D42_both")
+for (day in day_options){
+      seu.day <- subset_seu_by_day(seu.integrated, day)
+      
+  # drop unused levels - do it everywhere!!!
+    cluster_sizes <- table(seu.day$cluster_type)
+    keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+    seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+    if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+        seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+    }
+    seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+  
+  # Calculate percentages for each sample
+  cluster_num <- table(seu.day$cluster_type, seu.day$sample.names)
+  cluster_perc <- round(prop.table(cluster_num, margin = 2) * 100, digits=2)
+    # stacked bars plot:
+  # Make sure Sample is a factor (for ordering) and Cluster is a factor
+  prop_long <- as.data.frame(cluster_perc)
+  colnames(prop_long) <- c("Cluster", "Sample", "Percentage")
+  prop_long$Cluster <- factor(prop_long$Cluster, levels = bio_order)
+  prop_long$Cluster <- droplevels(prop_long$Cluster)
+  prop_long$Sample <- factor(prop_long$Sample)
+  
+  actual_day <- limma::strsplit2(day, "_")[[1]]
+  
+  # use cluster_names_dict & sample_names_dict
+  prop_long$Cluster <- dplyr::recode(
+    as.character(prop_long$Cluster),
+    !!!cluster_names_dict[[ct]][[actual_day]]
+  )
+  # also keep order
+  prop_long$Cluster <- factor(prop_long$Cluster, levels = unique(prop_long$Cluster))
+  
+  # rename palette as well
+  # my_palette <- my_palette_orig
+  my_palette <- cluster_palette
+  names(my_palette) <- dplyr::recode(
+    names(my_palette),
+    !!!cluster_names_dict[[ct]][[actual_day]]
+  )
+  
+  # and recode the sample names
+  prop_long$Sample <- dplyr::recode(
+    as.character(prop_long$Sample),
+    !!!sample_names_dict
+  )
+  # also keep order
+  prop_long$Sample <- factor(prop_long$Sample, levels = unique(prop_long$Sample))
+  
+  # Plot proportions as a single stacked barplot
+  p_prop <- ggplot(prop_long, aes(x = Sample, y = Percentage, fill = Cluster)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    scale_fill_manual(values = my_palette) +
+    theme_bw() +
+    labs(y = "Percentage of cells (%)", x = "") +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1, size = 11),
+      #axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 14),
+      panel.grid.major.x = element_blank(),
+      legend.position = "right", # Move legend to the side
+      legend.text = element_text(size = 12),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+    )
+  
+  print(p_prop)
+  # Save the proportion plot
+  ggsave(file.path(Figures, paste("Cluster_percentages_stacked_", ct, "_selres_", selres, "_day_", day,
+                        "_nHVG", nHVG_str, ".pdf", sep="")), p_prop, width = 8,   height = 5)
+}
+
+day_options <- c("D42_hTH")
+for (day in day_options){
+      seu.day <- subset_seu_by_day(seu.integrated, day)
+      
+  # drop unused levels - do it everywhere!!!
+    cluster_sizes <- table(seu.day$cluster_type)
+    keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+    seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+    if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+        seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+    }
+    seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+  
+  # Additionally, plot from previous annotation
+  ##### first all the renaming:
+  new_cluster_ids <- dplyr::recode(
+    as.character(Idents(seu.day)),
+    !!!cluster_names_dict[[ct]][[actual_day]]
+  )
+  # Preserve cluster order
+  renamed_cluster_order <- unique(dplyr::recode(
+    bio_order,
+    !!!cluster_names_dict[[ct]][[actual_day]]
+  ))
+  
+  new_cluster_ids <- factor(
+    new_cluster_ids,
+    levels = unique(renamed_cluster_order)
+  )
+  
+  # Store back into Seurat object
+  seu.day$cluster_type_renamed <- new_cluster_ids
+  Idents(seu.day) <- "cluster_type_renamed"
+  ##### end of renaming
+    
+  p_qc <- VlnPlot(seu.day, features = c("percent.mito", "StressScore1"),
+      cols = my_palette)
+  p_qc[[1]] <- p_qc[[1]] + labs(title = "Mitochondrial %")+
+    scale_x_discrete(labels = function(x) abbrev_dict[x]) 
+  p_qc[[2]] <- p_qc[[2]] + labs(title = "Stress Score")+
+    scale_x_discrete(labels = function(x) abbrev_dict[x])
+  
+  # Standard Color/Theme adjustments
+  p_qc <- p_qc & theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(size = 16),
+      plot.title = element_text(size = 20),
+      plot.margin = margin(l = 30, r = 10, t = 10, b = 10)
+  ) 
+  #& scale_x_discrete(limits = rev) # reverse order 
+  plot(p_qc)
+  ggsave(file.path(Figures, paste("clusters_percent.mito_", ct, "_res_", selres,
+                                  "_day_", day, "_nHVG", nHVG_str, ".pdf", sep="")),
+         p_qc, width = 15, height = 10)
+  
+  
+  # add cell cycle as well
+  
+  # --- 1. Cell Cycle Distribution (Proportion Barplot) ---
+  cell_cycle_df <- as.data.frame(seu.day@meta.data[, c("cluster_type_renamed", "Phase")])
+  cell_cycle_df$cluster_type_renamed <- factor(as.character(cell_cycle_df$cluster_type_renamed),
+                                         levels = renamed_cluster_order)
+  
+  # Color/Standard Version
+  p_cc <- ggplot(cell_cycle_df, aes(x = cluster_type_renamed, fill = Phase)) +
+      geom_bar(position = "fill") +
+      theme_minimal() +
+      labs(y = "Proportion", x = NULL) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size=12),
+            axis.text.y = element_text(size = 14),
+            legend.text = element_text(size = 12))
+  plot(p_cc)
+  ggsave(file.path(Figures, paste("clusters_cellcycle_", ct, "_res_", selres, 
+                                  "_day_", day, "_nHVG", nHVG_str, ".pdf", sep="")),
+         p_cc, width = 8, height = 6)
+  
+  
+  # plot additional violinplots
+  p_vln <- VlnPlot(seu.day, features = violinplot_array, 
+                   # split.by = "sample_names_renamed", split.plot = T,
+      cols = my_palette)
+  
+  # Standard Color/Theme adjustments
+  p_vln <- p_vln & theme(
+      axis.title.x = element_blank(),
+      plot.margin = margin(l = 30, r = 10, t = 10, b = 10)
+  ) 
+  #& scale_x_discrete(limits = rev) # reverse order 
+  plot(p_vln)
+  ggsave(file.path(Figures, paste("violin_", ct, "_res_", selres,
+                                  "_day_", day, "_nHVG", nHVG_str, ".pdf", sep="")),
+         p_vln, width = 20, height = 15)
+  
+ }
+
+```
+
+
+<!-- # Van-Haver Marker Module Scores -->
+<!-- In this section, the expression of each of the Van-Haver marker sets is visulaized as an aggregate score.  -->
+<!-- ```{r EpiC-Marker-Plots, fig.width=15, fig.height=10} -->
+
+<!-- day_options <- c( "D26_WT", "D26_STOP_MYCN", "D42_novirus", "D42_hTH") -->
+<!-- for (day in day_options){ -->
+<!--       seu.day <- subset_seu_by_day(seu.integrated, day) -->
+
+<!--   # drop unused levels - do it everywhere!!! -->
+<!--     cluster_sizes <- table(seu.day$cluster_type) -->
+<!--     keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters]) -->
+<!--     seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters) -->
+<!--     if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){ -->
+<!--       seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH) -->
+<!--     } -->
+<!--     seu.day$cluster_type <- droplevels(seu.day$cluster_type) -->
+
+
+<!--   # ------------------------------------------------------- -->
+<!--   # FeaturePlots -->
+<!--   # ------------------------------------------------------- -->
+
+<!--   Idents(seu.day) <- paste("num_id", day, sep="_") -->
+
+<!--   pp <- list() -->
+
+<!--   for (marker_name in marker_names) { -->
+
+<!--     pp[[marker_name]] <- FeaturePlot( -->
+<!--       seu.day, -->
+<!--       label = TRUE, -->
+<!--       label.size = 8, -->
+<!--       repel = TRUE, -->
+<!--       features = marker_name, -->
+<!--       reduction = "umap", -->
+<!--       min.cutoff = "q05", -->
+<!--       max.cutoff = "q95" -->
+<!--     ) + -->
+
+<!--       scale_colour_gradient( -->
+<!--         low = "lightgrey", -->
+<!--         high = "purple", -->
+<!--         limits = c(min_val, max_val), -->
+<!--         oob = scales::squish -->
+<!--       ) + -->
+
+<!--       theme( -->
+<!--         plot.title = element_text( -->
+<!--           hjust = 0.5, -->
+<!--           face = "bold", -->
+<!--           size = 16 -->
+<!--         ) -->
+<!--       ) -->
+<!--   } -->
+
+<!--     # ========================================== -->
+<!--     # 1. CREATE A DUAL-KEY PALETTE FOR TODAY -->
+<!--     # ========================================== -->
+<!--     legend_name <- paste("legend_label", day, sep="_") -->
+<!--     day_mapping <- unique(as.data.frame(seu.day@meta.data[,  -->
+<!--                             c("cluster_type", legend_name)])) -->
+
+<!--     # Map colors to the old cluster names (what the hulls are looking for) -->
+<!--     palette_old <- my_palette_orig[as.character(day_mapping$cluster_type)] -->
+<!--     names(palette_old) <- as.character(day_mapping$cluster_type) -->
+
+<!--     # Map colors to the new legend labels (what DimPlot is looking for) -->
+<!--     palette_new <- my_palette_orig[as.character(day_mapping$cluster_type)] -->
+<!--     names(palette_new) <- as.character(day_mapping[[legend_name]]) -->
+
+<!--     # Merge them together so the palette can answer to BOTH names correctly -->
+<!--     day_universal_palette <- c(palette_old, palette_new) -->
+<!--     day_universal_palette <- day_universal_palette[!duplicated(names(day_universal_palette))] -->
+
+<!--   # ------------------------------------------------------- -->
+<!--   # Legend -->
+<!--   # ------------------------------------------------------- -->
+<!--   legend_order <- sort(unique(seu.day[[legend_name]][,1])) -->
+<!--   dummy_data <- data.frame(umap_1 = seq_along(legend_order), umap_2 = 0,  -->
+<!--                            #legend_label = unique(seu.day$legend_label) -->
+<!--                            legend_label = factor(legend_order, levels = legend_order) -->
+<!--                            ) -->
+<!--   p_legend <- ggplot(dummy_data, aes(x = umap_1, y = umap_2, color = legend_label)) + -->
+<!--   geom_point(alpha = 0) +  -->
+<!--   theme_void() + -->
+<!--   scale_color_manual(values = day_universal_palette) + -->
+<!--   labs(color = "Clusters") +  -->
+<!--   theme( -->
+<!--     legend.position = "left",  -->
+<!--     legend.justification = "left", -->
+<!--     legend.text = element_text(size = 12),  -->
+<!--     legend.title = element_text(size = 14, face = "bold") -->
+<!--   ) + -->
+<!--   guides(color = guide_legend(override.aes = list(alpha = 0, size = 0))) -->
+
+<!--     # ------------------------------------------------------- -->
+<!--   # Combine -->
+<!--   # ------------------------------------------------------- -->
+
+<!--   p_final <- wrap_plots( -->
+<!--     A = pp[[marker_names[1]]], -->
+<!--     B = pp[[marker_names[2]]], -->
+<!--     C = pp[[marker_names[3]]], -->
+<!--     D = pp[[marker_names[4]]], -->
+<!--     E = pp[[marker_names[5]]], -->
+<!--     F = pp[[marker_names[6]]], -->
+<!--     G = p_legend, -->
+<!--     design = "ABCG\nDEFG", -->
+<!--     widths = c(1, 1, 1, 0.4) -->
+<!--   ) -->
+
+<!--   # print(p_final) -->
+<!--   # Save result -->
+<!--   outfig <- file.path(Figures, paste("clusters_samples_newnames_vanHaver_markers_", ct, -->
+<!--                                      "_res_", selres, "_day_", day,  "_nHVG", nHVG_str, ".pdf", sep="")) -->
+<!--   ggsave(outfig, plot=p_final, width=15, height=10) -->
+
+<!-- } -->
+
+<!-- ``` -->
+
+
+
+
+
+<!-- # Marker Gene DotPlots -->
+
+<!-- Visualizing top markers and Van-Haver markers on dotplots. The name of the top markers is legible on the saved plot, since that is wider. -->
+<!-- ```{r EpiC-Marker-DotPlots, fig.width=50, fig.height=6} -->
+
+<!-- # --- 3. Van-Haver Markers DotPlot (Color) --- -->
+<!-- gene_all <- c() -->
+<!-- marker_list_flat <- marker_list -->
+<!-- for (mname in names(marker_list_flat)){ -->
+<!--   marker_list_flat[[mname]] <- setdiff(marker_list_flat[[mname]], gene_all) -->
+<!--   gene_all <- union(gene_all, marker_list_flat[[mname]]) -->
+<!-- } -->
+
+<!-- Idents(seu.integrated) <- "cluster_type" -->
+
+<!-- p_dot_vh <- DotPlot( -->
+<!--       seu.integrated, -->
+<!--       features = marker_list_flat,  -->
+<!--       cols = c("lightgrey", "red"), -->
+<!--       col.min = 0, -->
+<!--       dot.scale = 6, -->
+<!--       assay = "SCT" -->
+<!--     ) + -->
+<!--     theme_bw() + -->
+<!--     RotatedAxis() +  -->
+<!--     theme( -->
+<!--       axis.text.x = element_text(size = 12), -->
+<!--       axis.title.x = element_blank(),  -->
+<!--       axis.title.y = element_blank(),  -->
+<!--       strip.clip = "off" -->
+<!--     )  -->
+<!-- p_dot_vh$data <- p_dot_vh$data[p_dot_vh$data$pct.exp > 0, ] # remove zero percent dots! -->
+
+<!-- # Display and save Van-Haver color version -->
+<!-- plot(p_dot_vh)   -->
+<!-- ggsave(file.path(Figures, paste("VanHaver_Markers_DotPlot_newnames_", ct, "_selres_", selres, -->
+<!--                                 "_all_nHVG", nHVG_str, ".pdf", sep="")),  -->
+<!--        p_dot_vh, width = 16, height = 6) -->
+
+<!-- ``` -->
+
+
+
+
+# Marker Gene DotPlots for different days
+Visualizing top markers and Van-Haver markers on dotplots. The name of the top markers is legible on the saved plot, since that is wider. A grayscale figure is also generated and saved.
+
+```{r EpiC-Marker-DotPlots for days, fig.width=50, fig.height=6}
+
+gene_all <- c()
+marker_list_flat <- marker_list
+for (mname in names(marker_list_flat)){
+  marker_list_flat[[mname]] <- setdiff(marker_list_flat[[mname]], gene_all)
+  gene_all <- union(gene_all, marker_list_flat[[mname]])
+}
+
+
+day_options <- c("D26_WT", "D26_STOP_MYCN", "D42_novirus", "D42_hTH")
+for (day in day_options){
+      seu.day <- subset_seu_by_day(seu.integrated, day)
+      
+  # # drop unused levels - do it everywhere!!!
+  #   cluster_sizes <- table(seu.day$cluster_type)
+  #   keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+  #   seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+  #   if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+  #     seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+  #   }
+  #   seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+    
+    
+        # drop unused levels - do it everywhere!!!
+      cluster_sizes <- table(seu.day$cluster_type)
+      keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+      seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+      if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+        seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+      }
+      seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+      
+      seu.day$num_id <- seu.day[[selres]]
+      seu.day$num_id <- droplevels(seu.day$num_id)
+      
+      # add num_id order; TO DO later: num_id_final - take into account that some clusters appear in earlier days first
+      actual_numbers <- as.numeric(as.character(unique(seu.day$num_id)))
+      sorted_numeric_levels <- as.character(sort(actual_numbers))
+      seu.day$num_id <- factor(seu.day$num_id, levels = sorted_numeric_levels)
+        
+      # print(day)
+      # print(table(seu.day$sample.names))
+          
+      # use new names
+      actual_day <- limma::strsplit2(day, "_")[[1]]
+      
+      # Rename clusters from previous annotation
+      if (actual_day %in% names(cluster_names_dict[[ct]])){
+          new_cluster_ids <- dplyr::recode(
+          as.character(seu.day$cluster_type),
+          !!!cluster_names_dict[[ct]][[actual_day]]
+        )
+        # Preserve cluster order
+        renamed_cluster_order <- unique(dplyr::recode(
+          bio_order,
+          !!!cluster_names_dict[[ct]][[actual_day]]
+        ))
+        
+        new_cluster_ids <- factor(
+          new_cluster_ids,
+          levels = unique(renamed_cluster_order)
+        )
+        
+        # Store back into Seurat object and construct final legend text
+        seu.day$cluster_type_renamed <- new_cluster_ids
+        Idents(seu.day) <- "cluster_type_renamed"
+        seu.day$legend_label <- paste0(seu.day$num_id, ": ", seu.day$cluster_type_renamed)
+      } else {
+          new_cluster_ids <- seu.day$cluster_type
+          renamed_cluster_order <- bio_order
+          # Store back into Seurat object and construct final legend text
+          seu.day$cluster_type_renamed <- new_cluster_ids
+          Idents(seu.day) <- "cluster_type_renamed"
+          seu.day$legend_label <- paste0(seu.day$num_id, ": ", seu.day$cluster_type_renamed)
+      }
+  
+
+  # -------------------------------------------------------
+  # FeaturePlots
+  # -------------------------------------------------------
+
+  #Idents(seu.day) <- paste("cluster_type_renamed", day, sep="_")
+  Idents(seu.day) <- "cluster_type_renamed"
+  
+  # --- 3. Van-Haver Markers DotPlot (Color) ---
+  p_dot_vh <- DotPlot(
+        seu.day,
+        features = marker_list_flat, 
+        cols = c("lightgrey", "red"),
+        #col.min = 0,
+        dot.scale = 6,
+        assay = "SCT"
+        # assay = "RNA"
+      ) +
+      theme_bw() +
+      scale_y_discrete(labels = function(x) abbrev_dict[x]) +
+      RotatedAxis() + 
+      theme(
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1, vjust = 1),
+        #axis.text.y = element_text(size = 14, angle = -45, hjust = 1, vjust = 1),
+        axis.text.y = element_text(size = 16),
+        strip.text.x = element_text(size = 16, angle = 30, hjust = 0.5),
+        #axis.text.x = element_text(size = 12),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        strip.clip = "off"
+      ) 
+
+  p_dot_vh$data <- p_dot_vh$data[p_dot_vh$data$pct.exp > 0, ] # remove zero percent dots!
+
+  # # Display and save Van-Haver color version
+  # plot(p_dot_vh)  
+  # ggsave(file.path(Figures, paste("VanHaver_Markers_DotPlot_newnames_", ct, "_selres_", selres,
+  #                                 "_day_", day, "_nHVG", nHVG_str, ".pdf", sep="")), 
+  #        p_dot_vh, width = 16, height = 6)
+  
+  # # problem: different x tick label -> different actual dotplot sizes
+  g <- ggplotGrob(p_dot_vh)
+  g$layout[grepl("axis-l", g$layout$name), c("name", "t", "l", "b", "r")] # run once to find name
+  axis_l_row <- which(g$layout$name == "axis-l-1")
+  axis_l_col <- g$layout$l[axis_l_row]
+  
+  g$widths[axis_l_col] <- unit(2, "in")   # <- SAME fixed value every iteration
+  
+  ggsave(file.path(Figures, paste("VanHaver_Markers_DotPlot_newnames_", ct, "_selres_", selres,
+                                  "_day_", day, "_nHVG", nHVG_str, ".pdf", sep="")), 
+         g, width = 16, height = 6)
+  
+    }
+
+```
+
+
+# HOX and Structural Gene Sets for different days
+HOX and structural gene sets for different days  - but it takes a long time to plot the dimplots
+change toraster to TRUE for faster but not so nice figure generation
+```{r HOX and structural gene sets for different days}
+# ==============================================================================
+# STEP 1: PRE-COMPUTE ALL GENE STRUCTURES (Run ONCE outside the loop!)
+# ==============================================================================
+toraster <- FALSE
+
+existing_genes <- rownames(seu.integrated[["SCT"]])
+
+hox_list_flat       <- clean_and_flatten_list(hox_list, existing_genes)
+structure_list_flat <- clean_and_flatten_list(structure_list, existing_genes)
+dimplot_list_flat   <- clean_and_flatten_list(dimplot_list, existing_genes)
+CD44_flat <- clean_and_flatten_list(CD44_dimplots, existing_genes)
+CD44_mod <- clean_and_flatten_list(CD44_dimplots_MES, existing_genes)
+
+# ==============================================================================
+# STEP 2: THE HIGH-SPEED LOOP
+# ==============================================================================
+# day_options <- c("D26_both", "D42_both", "D26_WT", "D26_STOP_MYCN",
+#                   "D42_novirus", "D42_hTH", "all")
+# day_options <- c("D26_both", "D42_both", "D26_WT", "D26_STOP_MYCN",
+#                   "D42_novirus", "D42_hTH")
+# # temporary
+day_options <- c("D42_hTH")
+for (day in day_options){
+  message("Processing day condition: ", day)
+  
+  # Subset and clean identity slots
+  seu.day <- subset_seu_by_day(seu.integrated, day)
+  cluster_sizes <- table(seu.day$cluster_type)
+  keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+  seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+  if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+      seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+  }
+  seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+  
+  Idents(seu.day) <- paste("cluster_type_renamed", day, sep="_")
+  
+  # ----------------------------------------------------------------------------
+  # FUNCTION TO PROCESS A GENE LIST IN A SINGLE PASS
+  # ----------------------------------------------------------------------------
+  process_gene_plots <- function(seu.in, flat_gene_list, prefix_name, 
+                                 dot_height, dot_width, grid_height, is_main_marker = FALSE) {
+    features_v <- unlist(flat_gene_list)
+    if(length(features_v) == 0) return(NULL)
+    #Idents(seu.in) <- paste("cluster_type_renamed", day, sep="_")
+    
+    # 1. DotPlot Generation
+    p_dot <- DotPlot(seu.in, features = flat_gene_list, cols = c("lightgrey", "red"),
+                     col.min = 0, dot.scale = 6, assay = "SCT") +
+      theme_bw() + RotatedAxis() + scale_y_discrete(labels = function(x) abbrev_dict[x]) +
+      theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1, vjust = 1), 
+            axis.text.y = element_text(size = 16), 
+            strip.text.x = element_text(size = 16),
+            axis.title.x = element_blank(), axis.title.y = element_blank(), strip.clip = "off")
+    # Apply extra formatting block if it's the main marker block
+    if(is_main_marker) {
+      p_dot <- p_dot + theme(strip.text.x = element_text(size = 12, face = "bold", angle = 90, hjust = 0, vjust = 0.5, lineheight = 0.8))
+    }
+    p_dot$data <- p_dot$data[p_dot$data$pct.exp > 0, ] # remove zero percent dots!
+    
+    ggsave(file.path(Figures, paste0(prefix_name, "_Markers_DotPlot_newnames_", ct, "_selres_", selres, "_day_", day, "_nHVG", nHVG_str, ".pdf")), 
+           p_dot, width = dot_width, height = dot_height)
+    
+    # 2. FeaturePlot Generation - RUN EXACTLY ONCE 
+    p_list <- FeaturePlot(seu.in, features = features_v, combine = FALSE, raster = toraster)
+    names(p_list) <- features_v
+    
+    # Apply the standard custom coloring to our base list
+    p_list_colored <- lapply(p_list, function(p) {
+      p + scale_colour_gradient(low = "lightgrey", high = "purple", limits = c(min_val, max_val), oob = scales::squish)
+    })
+    
+    # 3. Save Wrapped Master Matrix Plot
+    p_dim_wrapped <- patchwork::wrap_plots(p_list_colored)
+    ggsave(file.path(Figures, paste0(prefix_name, "_Markers_DimPlot_newnames_", ct, "_selres_", selres, "_day_", day, "_nHVG", nHVG_str, ".pdf")),
+           p_dim_wrapped, width = if(is_main_marker) 32 else 16, height = grid_height)
+    
+    # 4. Apply Canvas Axes to individual copies and save separately
+    for (pname in names(p_list_colored)) {
+      pf_canvas <- add_corner_axes(p_list_colored[[pname]])
+      ggsave(file.path(Figures_dimplots, paste0(prefix_name, "_Markers_DimPlot_newnames_", ct, "_selres_", selres, "_day_", day, "_nHVG", nHVG_str, "_", pname, ".pdf")), 
+             pf_canvas, width = 4, height = 4)
+    }
+  }
+  
+  # ----------------------------------------------------------------------------
+  # EXECUTE BACK-TO-BACK PROCESSSING
+  # ----------------------------------------------------------------------------
+  process_gene_plots(seu.day, hox_list_flat, "HOX", dot_height = 6, dot_width=16, grid_height = 10)
+  process_gene_plots(seu.day, structure_list_flat, "Structure", dot_height = 6, dot_width=16, grid_height = 12)
+  process_gene_plots(seu.day, dimplot_list_flat, "Main", dot_height = 6, dot_width=16, grid_height = 18, is_main_marker = TRUE)
+  process_gene_plots(seu.day, CD44_flat, "CD44", dot_height = 10, dot_width=10, grid_height = 10) # note: adjust name handling if needed
+  if (ct=="kolf2" & (day=="D42_hTH" | day=="D42_both")){
+    seu.subset <- subset(seu.day, subset = cluster_type %in% c("type_EGFP_MES", "type_EGFP_tumor"))
+    seu.subset$cluster_type <- droplevels(seu.subset$cluster_type)
+    process_gene_plots(seu.subset, CD44_mod, "CD44_mod", dot_height = 3, dot_width=10, grid_height = 10) 
+  }
+}
+```
+

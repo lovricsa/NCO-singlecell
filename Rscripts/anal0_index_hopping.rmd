@@ -21,7 +21,6 @@ output:
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=12, fig.height=12)
 library(openxlsx)
 library(tidyverse)
-library(scales)
 library(here)
 ```
 
@@ -143,7 +142,6 @@ index_hopping <- openxlsx::read.xlsx(
   sheet = "Index_Hopping_Counts"
 )
 
-# CRITICAL FIX: Replaced brittle hardcoded row subtraction with explicit NA filtering
 index_hopping <- index_hopping %>% 
   filter(!is.na(index) & index != "")
 
@@ -171,10 +169,11 @@ analysis <- hopped_reads %>%
   filter(!is.na(SampleID_1) & !is.na(SampleID_2))
 
 sample_hopping_summary <- analysis %>%
-  group_by(SampleID_1) %>%
+  group_by(SampleID_1, SampleID_2) %>%
+  summarise(Pair_Hopped_Reads = sum(Hopped_Reads), .groups = "drop_last") %>%
   summarise(
-    Total_Hopped_Reads = sum(Hopped_Reads),
-    Top_Donor = SampleID_2[which.max(Hopped_Reads)],
+    Total_Hopped_Reads = sum(Pair_Hopped_Reads),
+    Top_Donor = SampleID_2[which.max(Pair_Hopped_Reads)],
     .groups = "drop"
   ) %>%
   left_join(
@@ -183,6 +182,7 @@ sample_hopping_summary <- analysis %>%
   ) %>%
   mutate(Hopping_Rate_Percent = Total_Hopped_Reads / Valid_Reads * 100) %>%
   arrange(desc(Hopping_Rate_Percent))
+
 
 knitr::kable(
   sample_hopping_summary,

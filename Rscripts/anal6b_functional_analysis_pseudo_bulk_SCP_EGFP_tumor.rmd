@@ -1,0 +1,1043 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 6b - functional analysis for specific clusters"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the single cell RNA sequencing.
+
+```{r libraries}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+packages <- c(
+  "knitr",
+  "Seurat",
+  "ggplot2",
+  "patchwork",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "here",
+  "stringr",
+  "openxlsx",
+  "limma",
+  "edgeR",
+  "msigdbr",
+  "clusterProfiler",
+  "enrichplot",
+  "EnhancedVolcano",
+  "pathview",
+  "AnnotationDbi",
+  "org.Hs.eg.db",
+  "enrichplot"
+)
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+
+Folder structure
+```{r}
+Datafolder     <- here("Data")
+Data_calc <- here("Data_calculated") # Path to find Part 1 and 2 outputs
+
+# Subdirectories specifically isolated for this run's outputs
+Figures   <- here(file.path("Figures", "pseudo_bulk_SCP_EGFP_tumor"))
+Data_calc <- here("Data_calculated")
+Data_public <- here("Data_public")
+Results   <- here("Results")
+
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+
+utils_file <- here("Rscripts","utils.R")
+if (file.exists(utils_file)) source(utils_file)
+```
+
+Config parameters and marker lists
+```{r}
+config_file <- here("Rscripts","config.R")
+source(config_file)
+
+# for the same figures
+set.seed(734)
+```
+
+
+Read in sample and reference data
+Select all clusters that will be uesd for the DE analysis
+```{r selection of specific clusters}
+pseudo_bulk <- list()
+for (ct in c("EpiC", "kolf2")) {
+  # 1. Load Data
+  outfile <- file.path(Results, paste0("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds"))
+  seu.integrated <- LoadSeuratRds(outfile)
+  day <- "D42_both"
+  seu.day <- subset_seu_by_day(seu.integrated, day)
+  
+  cluster_sizes <- table(seu.day$cluster_type)
+  keep_clusters <- names(cluster_sizes[cluster_sizes >= 10])
+  seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+  seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+  
+  # 3. Rename Clusters based on Dictionary
+  actual_day <- limma::strsplit2(day, "_")[[1]]
+  bio_order <- bio_order_list[[ct]]
+  
+  if (actual_day %in% names(cluster_names_dict[[ct]])) {
+    new_cluster_ids <- dplyr::recode(
+      as.character(seu.day$cluster_type),
+      !!!cluster_names_dict[[ct]][[actual_day]]
+    )
+    
+    renamed_cluster_order <- unique(dplyr::recode(
+      bio_order,
+      !!!cluster_names_dict[[ct]][[actual_day]]
+    ))
+    
+    seu.day$cluster_type_renamed <- factor(new_cluster_ids, levels = renamed_cluster_order)
+    Idents(seu.day) <- "cluster_type_renamed"
+  }
+  
+  seu.day$cluster_type_renamed <- droplevels(seu.day$cluster_type_renamed)
+  table(seu.day$sample_names_renamed, seu.day$cluster_type_renamed)
+  
+  target_cell <- ifelse(ct == "EpiC", "H1", "H2")
+  target_list <- list(
+    "SCP_in_virus_vs_novirus" = list(
+      "target_samples"  = paste(target_cell, c("STOP-MYCN no virus D42", "STOP-MYCN hTH-Cre D42"), sep = " "),
+      "target_clusters" = c("late SCP", "late SCP")
+    ),
+    "EGFP_tumor_vs_SCP_in_virus" = list(
+      "target_samples"  = paste(target_cell, c("STOP-MYCN hTH-Cre D42", "STOP-MYCN hTH-Cre D42"), sep = " "),
+      "target_clusters" = c("late SCP", "EGFP ADRN-like")
+    ),
+    "ENF_in_virus_vs_novirus" = list(
+      "target_samples"  = paste(target_cell, c("STOP-MYCN no virus D42", "STOP-MYCN hTH-Cre D42"), sep = " "),
+      "target_clusters" = c("late endoneural fibroblast", "late endoneural fibroblast")
+    ),
+    "MES_tumor_vs_ENF_in_virus" = list(
+      "target_samples"  = paste(target_cell, c("STOP-MYCN hTH-Cre D42", "STOP-MYCN hTH-Cre D42"), sep = " "),
+      "target_clusters" = c("late endoneural fibroblast", "EGFP MES-like")
+    )
+  )
+  
+  # Collect unique combinations requested across all comparisons
+  req_pairs <- map_dfr(target_list, function(x) {
+    tibble(
+      sample = x$target_samples,
+      cluster = x$target_clusters
+    )
+  }) %>% distinct()
+  
+  # Filter Seurat object to keep cells matching valid (sample, cluster) pairs
+  seu.day$group_check <- paste0(seu.day$cluster_type_renamed, "___", seu.day$sample_names_renamed)
+  valid_groups <- paste0(req_pairs$cluster, "___", req_pairs$sample)
+
+  seu.pb.sub <- subset(seu.day, subset = group_check %in% valid_groups)
+  # ITT TARTOK
+  seu.pb.sub$plot_id <- paste0(ct, "_", seu.pb.sub$cluster_type_renamed, "_", seu.pb.sub$sample.names)
+  Idents(seu.pb.sub) <- "plot_id"
+  
+  # Generate Pseudobulk Counts Matrix
+  pb_counts <- AggregateExpression(
+    seu.pb.sub, 
+    assays = "RNA", 
+    slot = "counts", 
+    return.seurat = FALSE
+  )$RNA
+  
+  # Clean up column names for clarity
+  colnames(pb_counts) <- gsub("[ -]", "_", colnames(pb_counts))
+  
+  pseudo_bulk[[ct]] <- as_tibble(pb_counts, rownames = "gene_symbol")
+}
+
+# 6. Merge both cell lines into final pb_all
+pb_all <- reduce(pseudo_bulk, inner_join, by = "gene_symbol")
+```
+
+
+
+
+# calculate gene expression for each condition
+```{r calculate normalised expression}
+sample_annot <- data.frame(sample = colnames(pb_all)[-1]) %>%
+  mutate(
+    cell_line = factor(
+      if_else(startsWith(sample, "EpiC"), "EpiC", "kolf2"), 
+      levels = c("EpiC", "kolf2")
+    ),
+    condition = case_when(
+      str_detect(sample, "late_SCP.*STOP_MYCN_D42$")                ~ "SCP_novirus",
+      str_detect(sample, "late_SCP.*hTH")                           ~ "SCP_virus",
+      str_detect(sample, "EGFP_ADRN")                              ~ "EGFP_ADRN_like_virus",
+      str_detect(sample, "late_endoneural_fibroblast.*STOP_MYCN_D42$") ~ "ENF_novirus",
+      str_detect(sample, "late_endoneural_fibroblast.*hTH")         ~ "ENF_virus",
+      str_detect(sample, "EGFP_MES")                                ~ "EGFP_MES_like_virus"
+    ),
+    condition = factor(condition, levels = c(
+      "SCP_novirus", "SCP_virus", "EGFP_ADRN_like_virus",
+      "ENF_novirus", "ENF_virus", "EGFP_MES_like_virus"
+    ))
+  )
+
+# Construct design matrix
+design <- model.matrix(~ 0 + condition + cell_line, data = sample_annot)
+rownames(design) <- sample_annot$sample
+
+counts_matrix <- as.matrix(pb_all[, -1]) # Remove the gene_symbol column
+rownames(counts_matrix) <- pb_all$gene_symbol
+
+# 1. Create DGEList object (edgeR)
+dge <- edgeR::DGEList(counts = counts_matrix)
+
+# 2. Filter low expression genes (optional but recommended)
+keep <- filterByExpr(dge, group = colnames(pb_counts))
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge) # # Apply the TMM normalization (a standard step in the limma-voom workflow)
+
+
+# 4. Limma-Voom transformation
+vv <- voom(dge, design, plot = F)
+
+# save & plot intermediate results
+exprmx <- as_tibble(vv$E, rownames = "gene_symbol")
+# #print(dim(exprmx))
+# # merge with gene annotation
+# exprmx <- right_join(gene_annot, exprmx)
+# #print(dim(exprmx))
+
+# # save
+# tmpfile <- file.path(calcfolder, "edgeR_normcounts.txt")
+# write.table(exprmx, file=tmpfile, sep="\t", row.names = F)
+exprfile <- file.path(Results, "ps_bulk_logCPM_SCP_EGFP_tumor.xlsx")
+write.xlsx(exprmx, file = exprfile, colNames=T, rowNames=F)
+
+```
+
+
+The distribution of normalised expressions provides a snapshot of the gene expression in each sample. 
+```{r plot normalised expression of samples}
+# for the boxplot, create a long tibble first
+exprmx_long <- pivot_longer(exprmx, !c(gene_symbol),
+                            names_to = "sample", 
+                            values_to = "gene_expr")
+# # add sample annotation as well
+# exprmx_long <- full_join(exprmx_long, samples_annot, by=join_by(sample))
+
+exprmx_long <- exprmx_long %>%
+  mutate(
+    # Extract everything before the first '_'
+    cell = str_extract(sample, "^[^_]+"),
+    
+    # Check if the string cluster is tumor cluster
+    cluster = ifelse(str_detect(sample, "EGFP"), "tumor", "normal"),
+    
+    # Check if the sample is virus or novirus
+    type = ifelse(str_detect(sample, "hTH"), "virus", "novirus")
+  )
+
+# Verify the result
+table(exprmx_long$sample, exprmx_long$cell)
+table(exprmx_long$sample, exprmx_long$cluster)
+table(exprmx_long$sample, exprmx_long$type)
+
+exprmx_long$cell <- factor(exprmx_long$cell, levels=c("EpiC", "kolf2"))
+exprmx_long$cluster <- factor(exprmx_long$cell, levels=c("normal", "tumor"))
+exprmx_long$type <- factor(exprmx_long$type, levels=c("novirus", "virus"))
+
+
+p <- ggplot(exprmx_long, aes(x = sample, y = gene_expr, fill = cell, color = type)) + 
+  # Set alpha lower for more transparency
+  geom_violin(alpha = 0.4, linewidth = 2) +
+  # Boxplot inside with a bit more opacity than the violin
+  geom_boxplot(width = 0.1, color = "black", outlier.shape = NA, alpha = 0.6) +
+  # Use manual colors for Cancer
+  scale_fill_manual(values = c("EpiC" = "orange", "kolf2" = "seagreen")) +
+  # Aesthetic labels
+  labs(
+    y = expression(Log[2] ~ "Normalized Counts (CPM)"),
+    x = "Sample ID",
+    title = "Gene Expression Distribution per Sample"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1), 
+    legend.position = "top",
+    panel.grid.major.x = element_blank() # Cleans up the background for easier reading
+  )
+
+plot(p)
+
+# also save the plot
+#figfile <- file.path(figfolder, "boxplot_normalized.pdf")
+figfile <- file.path(Figures, "ps_bulk_violinplot_normalized_SCP_EGFP_tumor.pdf")
+ggsave(figfile, height=7, width=10)
+```
+
+
+## Principal Component Analysis (PCA)
+To assess global sample relationships and identify potential batch effects or outliers, we performed a Principal Component Analysis (PCA) on the log-transformed expression data. 
+
+### Interpretation of Variance
+PCA is a dimensionality reduction technique that projects samples onto axes (Principal Components) that capture the greatest sources of variation in the dataset.
+* **Sample Clustering:**
+
+* **Limitations:** It is important to note that PCA captures the **largest** global variances. While this is useful for identifying major biological groups, subtle but biologically significant changes—particularly those involving smaller gene sets—may be masked by these dominant global trends and are better captured through downstream differential expression and pathway analysis.
+
+The following plots visualize the first two principal components, which account for the majority of the total variance in the experiment. Click and drag to magnify.
+```{r PCA the  data}
+pca <- prcomp(t(vv$E), center = TRUE, scale. = FALSE)
+# calculate explained variance
+pca.var <- pca$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+
+sumvar <- 0
+for (pcind in 1:length(pca.var)){
+  sumvar <- sumvar + pca.var.per[pcind]
+  if (sumvar > 95){
+    maxi <- pcind
+    #print(maxi)
+    break
+  }
+}
+vardf <- as.data.frame(cbind('PC'=1:maxi, 'variance'=pca.var.per[1:maxi]))
+
+# #  scree plot
+# p <- ggplot(data=vardf) +
+#   geom_col(mapping=aes(x=PC, y=cumsum(variance)))+
+#   xlab("Principal Component") +  ylab("Cumulative percent variation") +
+#   geom_hline(yintercept=95, linetype="dashed",
+#              color = "red", linewidth=1)
+# plot(p)
+
+# nice labels
+nicelabels <- paste0("PC", 1:maxi, " (", vardf$variance, "%)")
+
+pca_df <- as_tibble(pca$x, rownames = "sample")
+pca_annot <- inner_join(pca_df, sample_annot, by=join_by(sample))
+pca_annot$cell_nice <- ifelse(pca_annot$cell_line=="EpiC", "H1", "H2")
+
+p <- ggplot(pca_annot, aes(x = PC1, y = PC2, shape = cell_nice, color = condition,
+                           text = paste("Sample:", sample, "<br>Group:", condition))) +
+  geom_point(size = 3) +
+  theme_gray(base_size = 18) + 
+  scale_shape(name = "Cell Line")+
+  scale_color_manual(name="Condition",
+        values = c("EGFP_ADRN_like_virus"="#111111",
+                                "SCP_virus"="#08519C", "SCP_novirus"="#4292C6",
+                   "EGFP_MES_like_virus"="#00441B",
+                                "ENF_virus"="#00796B", "ENF_novirus"="#41AE76"), 
+       labels = c("EGFP_ADRN_like_virus"="EGFP ADRN-like virus",
+                                "SCP_virus"="SCP virus", "SCP_novirus"="SCP novirus",
+                   "EGFP_MES_like_virus"="EGFP MES-like",
+                                "ENF_virus"="ENF virus", "ENF_novirus"="ENF novirus"))+
+  xlab(nicelabels[[1]])+ylab(nicelabels[[2]])
+  # geom_text(aes(label=Type_Exp), size = 2.5, vjust =  2.5)
+print(p)
+
+#plot(p)
+outfig <- file.path(Figures, "pca_samples_SCP_EGFP_tumor.pdf")
+ggsave(outfig, plot=p, height = 20, width= 30, units = "cm")
+
+p <- ggplot(pca_annot, aes(x = PC3, y = PC2, shape = cell_nice, color = condition,
+                           text = paste("Sample:", sample, "<br>Group:", condition))) +
+  geom_point(size = 3) +
+  theme_gray(base_size = 18) + 
+  scale_shape(name = "Cell Line")+
+  scale_color_manual(name="Condition",
+        values = c("EGFP_tumor_virus"="#111111",
+                                "SCP_virus"="#08519C", "SCP_novirus"="#4292C6",
+                   "MES_tumor_virus"="#00441B",
+                                "ENF_virus"="#00796B", "ENF_novirus"="#41AE76"), 
+       labels = c("EGFP_tumor_virus"="EGFP ADRN-like virus",
+                                "SCP_virus"="SCP virus", "SCP_novirus"="SCP novirus",
+                   "MES_tumor_virus"="EGFP MES-like",
+                                "ENF_virus"="ENF virus", "ENF_novirus"="ENF novirus"))+
+  xlab(nicelabels[[3]])+ylab(nicelabels[[2]])
+  # geom_text(aes(label=Type_Exp), size = 2.5, vjust =  2.5)
+print(p)
+
+#plot(p)
+outfig <- file.path(Figures, "pca_samples_SCP_EGFP_tumor_PC3_vs_PC2.pdf")
+ggsave(outfig, plot=p, height = 20, width= 30, units = "cm")
+
+#---------------------- nicely formatted plot_ly 3D plot--------------------------#
+
+# 1. Prepare data with one-liner strings
+pca_annot <- pca_annot %>%
+  mutate(
+    condition_clean = str_replace_all(as.character(condition), "_", " "),
+    legend_group = paste0(cell_nice, ": ", condition_clean)
+  )
+
+# 2. Map colors to the full "CellLine: Condition" string
+legend_colors <- c(
+  "H1: EGFP ADRN like virus" = "#111111", "H2: EGFP ADRN like virus" = "#111111",
+  "H1: SCP virus"        = "#08519C", "H2: SCP virus"        = "#08519C",
+  "H1: SCP novirus"      = "#4292C6", "H2: SCP novirus"      = "#4292C6",
+  "H1: EGFP MES like virus"  = "#00441B", "H2: EGFP MES like virus"  = "#00441B",
+  "H1: ENF virus"        = "#00796B", "H2: ENF virus"        = "#00796B",
+  "H1: ENF novirus"      = "#41AE76", "H2: ENF novirus"      = "#41AE76"
+)
+
+# 3. Map symbols to the full "CellLine: Condition" string
+# (H1 entries get 'circle', H2 entries get 'diamond')
+legend_symbols <- c(
+  "H1: EGFP ADRN like virus" = "circle",  "H2: EGFP ADRN like virus" = "diamond",
+  "H1: SCP virus"        = "circle",  "H2: SCP virus"        = "diamond",
+  "H1: SCP novirus"      = "circle",  "H2: SCP novirus"      = "diamond",
+  "H1: EGFP MES like virus"  = "circle",  "H2: EGFP MES like virus"  = "diamond",
+  "H1: ENF virus"        = "circle",  "H2: ENF virus"        = "diamond",
+  "H1: ENF novirus"      = "circle",  "H2: ENF novirus"      = "diamond"
+)
+
+# 4. Build 3D Plot
+p3d <- plot_ly(
+  pca_annot, 
+  x = ~PC1, 
+  y = ~PC2, 
+  z = ~PC3,
+  color = ~legend_group,                 # Single variable controls legend entries
+  colors = legend_colors,
+  symbol = ~legend_group,                # Passed here to prevent secondary legend traces
+  symbols = legend_symbols,              # Explicit mapping per combined key
+  type = "scatter3d", 
+  mode = "markers",
+  marker = list(size = 7), 
+  text = ~paste("Sample:", sample, "<br>", legend_group),
+  hoverinfo = "text"
+) %>%
+  layout(
+    font = list(size = 14),              
+    legend = list(
+      font = list(size = 18),            # Legend font size
+      itemsizing = "constant"            
+    ),
+    scene = list(
+      xaxis = list(
+        title = nicelabels[[1]],
+        backgroundcolor = "#E5E5E5",
+        gridcolor = "#FFFFFF",
+        showbackground = TRUE,
+        zerolinecolor = "#FFFFFF"
+      ),
+      yaxis = list(
+        title = nicelabels[[2]],
+        backgroundcolor = "#E5E5E5",
+        gridcolor = "#FFFFFF",
+        showbackground = TRUE,
+        zerolinecolor = "#FFFFFF"
+      ),
+      zaxis = list(
+        title = nicelabels[[3]],
+        backgroundcolor = "#E5E5E5",
+        gridcolor = "#FFFFFF",
+        showbackground = TRUE,
+        zerolinecolor = "#FFFFFF"
+      )
+    )
+  )
+
+# 2. Save the plot as an interactive HTML file
+htmlwidgets::saveWidget(as_widget(p3d), 
+  file.path(Figures, "pca_samples_SCP_EGFP_tumor_3D.html"))
+```
+
+
+## Differential Gene Expression Analysis
+
+Differential Gene Expression (DGE) was performed to identify transcriptomic shifts across various biological states. For all comparisons, **upregulated** genes are defined as those with significantly higher expression in the second condition of the contrast, while **downregulated** genes are those with significantly lower expression.
+
+
+### Output file
+Results are saved to diffexpr_all.xlsx and diffexpr_lfc1_adjp0.05_signif.xlsx files, where each tab contains the results of one of the above contrasts. In diffexpr_lfc1_adjp0.05_signif.xlsx only genes are listed for each contrast whose expression changed with at least 1 log fold change and adjusted p value <= 0.05.
+
+```{r calculate differential gene expression}
+
+# Fit the linear model
+fit <- lmFit(vv, design)
+
+
+# Note: Formatted as (Target - Baseline) so positive logFC = higher expression in Target
+contrast.matrix <- makeContrasts(
+  # 1. SCP: Virus vs No Virus baseline
+  SCP_virus_vs_novirus     = conditionSCP_virus - conditionSCP_novirus,
+  
+  # 2. EGFP ADRN-like vs SCP baseline (in virus condition)
+  EGFP_tumor_vs_SCP_virus  = conditionEGFP_ADRN_like_virus - conditionSCP_virus,
+  
+  # 3. ENF: Virus vs No Virus baseline
+  ENF_virus_vs_novirus     = conditionENF_virus - conditionENF_novirus,
+  
+  # 4. MES Tumor vs ENF baseline (in virus condition)
+  MES_tumor_vs_ENF_virus   = conditionEGFP_MES_like_virus - conditionENF_virus,
+  
+  # 4. MES Tumor vs ENF baseline (in virus condition)
+  EGFP_tumor_vs_MES_tumor   = conditionEGFP_ADRN_like_virus - conditionEGFP_MES_like_virus,
+  
+  levels = design
+)
+
+# # 2. Create the pairwise contrasts for the 3 conditions
+# contrast.matrix <- makeContrasts(
+#   # Compare Virus vs No Virus (Baseline)
+#   SCP_VirusVsNoVirus = conditionSCP_virus,
+#   
+#   # # Compare Tumor vs No Virus (Baseline)
+#   # TumorVsNoVirus = conditionEGFP_tumor_virus,
+#   
+#   # Compare Tumor vs Virus (Subtracting the two coefficients)
+#   EGFP_TumorVsSCP_Virus   = conditionEGFP_tumor_virus - conditionSCP_virus,
+#   
+#   # Optional: Keep your cell line comparison to control for background differences
+#   Kolf2VsEpiC    = cell_linekolf2 - cell_lineEpiC,
+#   
+#   levels = design
+# )
+
+fitc <- contrasts.fit(fit,contrast.matrix )
+fite <- eBayes(fitc) ## gives moderated t-statistics
+# save result for further use
+outfile <- file.path(Results, "limma_fit_diffexpr_SCP_EGFP_tumor_all_conditions.rds")
+saveRDS(fite, file=outfile)
+
+# also write out to human readable file
+lthr <- 1; pthr <- 0.05
+thrchar <- paste(sprintf("lfc%01d", lthr), 
+                   sprintf("adjp%.2f", pthr), sep="_")
+outdata <- list()
+outdata_signif <- list() # only write out genes whose diff expr is signif
+for (cf in colnames(fite$coefficients)){
+  toptt <- limma::topTable(fite, coef=cf, sort.by = "logFC",
+          number=nrow(fite$coefficients))
+  toptt <- as_tibble(toptt, rownames = "Gene_ID")
+  # # add annotation
+  # toptt <- left_join(toptt, gene_annot, by=c("Gene_ID"="gene_id"))
+  
+  # formatting
+  toptt <- toptt %>%
+    mutate(
+      across(c(logFC, AveExpr, t, B), ~ round(., 2)),
+      # P.Value and adj.P.Val formatted as strings to preserve notation in Excel
+      P.Value = format.pval(P.Value),
+      adj.P.Val = format.pval(adj.P.Val)
+    )
+  
+  # excel tab names
+  lname <- substr(cf,1, min(nchar(cf), 31)) # for each tab name, a maximum of 31 length is allowed
+  outdata[[lname]] <- toptt
+
+  # repeat with significant genes only
+  toptt_thr <- limma::topTable(fite, coef=cf, sort.by = "logFC",
+                p.value=pthr, lfc=lthr, number=nrow(fite$coefficients))
+  toptt_thr <- as_tibble(toptt_thr, rownames = "Gene_ID")
+  # # add annotation
+  # toptt_thr <- left_join(toptt_thr, gene_annot, by=c("Gene_ID"="gene_id"))
+    # formatting
+  toptt_thr <- toptt_thr %>%
+    mutate(
+      across(c(logFC, AveExpr, t, B), ~ round(., 2)),
+      # P.Value and adj.P.Val formatted as strings to preserve notation in Excel
+      P.Value = format.pval(P.Value),
+      adj.P.Val = format.pval(adj.P.Val)
+    )
+  outdata_signif[[lname]] <- toptt_thr
+}
+# write into a compound excel file
+outfile <- file.path(Results, "diffexpr_pseudobulk_all_SCP_EGFP_tumor_all_conditions.xlsx")
+write.xlsx(outdata, file = outfile, colNames=T, rowNames=F)
+outfile_signif <- outfile <- file.path(Results, 
+                     paste("diffexpr_pseudobulk_", thrchar, "_signif_all_SCP_EGFP_tumor_all_conditions.xlsx", sep=""))
+write.xlsx(outdata_signif, file = outfile_signif, colNames=T, rowNames=F)
+
+# # add volcano plot using EnhancedVolcano
+# res <- topTable(fite, coef = "EGFP_TumorVsSCP_Virus", number = Inf)
+#
+# p <- EnhancedVolcano(res,
+#   lab = rownames(res),
+#   x = 'logFC',
+#   y = 'adj.P.Val',
+#   title = 'Tumor vs Normal',
+#   pCutoff = 0.05,
+#   FCcutoff = 1.0,
+#   pointSize = 2.0,
+#   labSize = 3.0)
+# 
+# outfig <- file.path(Figures, "volcano_plot_SCP_EGFP_tumor.pdf")
+# ggsave(outfig, plot=p, height = 20, width= 30, units = "cm")
+
+# Generate and save Volcano Plots for ALL contrasts
+for (cf in colnames(fite$coefficients)) {
+  # Pull unformatted numeric table for EnhancedVolcano
+  res_numeric <- topTable(fite, coef = cf, number = Inf)
+  p <- EnhancedVolcano(
+    res_numeric,
+    lab = rownames(res_numeric),
+    x = 'logFC',
+    y = 'adj.P.Val',
+    title = gsub("_", " ", cf),
+    subtitle = paste("Pseudobulk DE (adj.P <", pthr, ", |logFC| >", lthr, ")"),
+    pCutoff = pthr,
+    FCcutoff = lthr,
+    pointSize = 2.0,
+    labSize = 3.0
+  )
+  fig_path <- file.path(Figures, paste0("volcano_plot_", cf, ".pdf"))
+  ggsave(fig_path, plot = p, height = 20, width = 30, units = "cm")
+}
+
+```
+
+
+# Heatmap
+
+```{r heatmap}
+num_genes <- 30
+
+# 1. Modify Column Annotation Metadata with standardized names
+heatmap_anno <- sample_annot %>% 
+  mutate(
+    # Convert cell line IDs: EpiC -> H1, everything else (kolf2) -> H2
+    Cell_Line = ifelse(cell_line %in% c("EpiC", "H1"), "H1", "H2"),
+    
+    # Replace underscores with spaces to match PCA legend naming
+    Condition = as.character(condition) %>%
+      str_replace_all("_", " ") %>%
+      str_replace_all("novirus", "no AAV1") %>%   # do this BEFORE the plain "virus" replace
+      str_replace_all("virus", "AAV1")
+  ) %>%
+  column_to_rownames("sample") %>% 
+  dplyr::select(Cell_Line, Condition)
+
+
+# 2. Define custom hex colors for Condition AND Cell_Line matching PCA palette
+anno_colors <- list(
+  Condition = c(
+    "EGFP ADRN like AAV1" = "#111111",
+    "SCP AAV1"        = "#08519C", 
+    "SCP no AAV1"      = "#4292C6",
+    "EGFP MES like AAV1"  = "#00441B",
+    "ENF AAV1"        = "#00796B", 
+    "ENF no AAV1"      = "#41AE76"
+  ),
+  Cell_Line = c(
+    "H1" = "#4A4A4A",
+    "H2" = "#D1D1D1"
+  )
+)
+
+
+# 3. Extract the underlying expression matrix
+expr_mat <- if (inherits(vv, "EList")) vv$E else as.matrix(vv)
+
+
+# 4. Helper function to extract top 50 up & top 50 down non-ENS genes
+get_heatmap_genes <- function(limma_fit, coefficient_name) {
+  tt <- limma::topTable(limma_fit, coef = coefficient_name, number = Inf)
+  tt_filtered <- as_tibble(tt, rownames = "Gene_ID") %>%
+    filter(!grepl("^ENS", Gene_ID)) %>% 
+    filter(adj.P.Val < 0.05)
+  
+  top_up   <- tt_filtered %>% arrange(desc(logFC)) %>% head(num_genes) %>% pull(Gene_ID)
+  top_down <- tt_filtered %>% arrange(logFC)        %>% head(num_genes) %>% pull(Gene_ID)
+  
+  return(c(top_up, top_down))
+}
+
+
+# 5. Gather unique target gene sets across contrasts
+genes_comp1 <- get_heatmap_genes(fite, "EGFP_tumor_vs_SCP_virus")
+genes_comp2 <- get_heatmap_genes(fite, "MES_tumor_vs_ENF_virus")
+combined_genes <- unique(c(genes_comp1, genes_comp2))
+
+# Subset the master matrix
+mat_combined <- expr_mat[combined_genes, , drop = FALSE]
+
+
+# 6. Generate and save the modified combined heatmap using ComplexHeatmap
+outfig_combined <- file.path(Figures, "heatmap_combined_progression_SCP_EGFP_tumor.pdf")
+
+# Generate heatmap object with transposed matrix (samples as rows, genes as columns)
+ht <- ComplexHeatmap::pheatmap(
+  t(mat_combined),                            
+  scale = "column",                            # Z-score scaling across genes (now columns)
+  annotation_row = heatmap_anno,              # Sample annotations on rows
+  annotation_colors = anno_colors,            # Exact hex palette for Condition & Cell_Line
+  show_rownames = FALSE,                      # Hide individual sample IDs
+  show_colnames = TRUE,                       # Display gene names
+  cluster_cols = TRUE,              
+  cluster_rows = TRUE,              
+  main = "z-score",
+  fontsize_col = 7,
+  heatmap_legend_param = list(title = "")     # Remove z-score title text
+)
+
+# Render plot and save to PDF
+pdf(outfig_combined, width = 16, height = 5) 
+
+draw(
+  ht, 
+  heatmap_legend_side = "top", 
+  annotation_legend_side = "top"
+)
+
+dev.off()
+```
+
+
+## Functional Enrichment Analysis
+
+To interpret the biological significance of the identified differentially expressed (DGE) and equivalent gene sets, we performed functional enrichment analysis using curated gene set collections from the Molecular Signatures Database (MSigDB).
+
+### Gene Set Collections
+We utilized three distinct categories of gene sets to capture a broad range of biological insights:
+
+* **Hallmark Gene Sets:** Represent specific, well-defined biological states or processes (e.g., hypoxia, inflammatory response) and provide a concise summary of the primary pathways involved.
+* **KEGG Medicus:** A subset of the Kyoto Encyclopedia of Genes and Genomes (KEGG) that focuses on the molecular networks of diseases and drug mechanisms, offering a more clinical and mechanistic perspective.
+* **GO Biological Process (GO:BP):** Comprehensive ontologies that describe the broader biological objectives (such as cell cycle or metabolic pathways) to which a gene contributes.
+
+This multi-faceted approach allows us to determine if the genes identified as "changing" or "stable" are non-randomly associated with specific biological functions or signaling pathways.
+
+```{r functional analysis, message=FALSE, warning=FALSE}
+geneset_collections <- list(
+  Hallmark = msigdbr(species = "Homo sapiens", collection = "H") %>%
+             dplyr::select(gs_name, gene_symbol, ensembl_gene),
+
+  KEGG_Medicus = msigdbr(species = "Homo sapiens", collection = "C2") %>%
+                 filter(gs_subcollection == "CP:KEGG_MEDICUS") %>%
+                 dplyr::select(gs_name, gene_symbol, ensembl_gene),
+
+  GO_Biological_Process = msigdbr(species = "Homo sapiens", collection = "C5") %>%
+                          filter(gs_subcollection == "GO:BP") %>%
+                          dplyr::select(gs_name, gene_symbol, ensembl_gene)
+)
+```
+
+# Create gene annotation
+```{r}
+
+# 1. Get your list of gene symbols from the object
+current_symbols <- rownames(seu.integrated)
+
+# 2. Query the database for IDs/Annotations
+gene_info <- AnnotationDbi::select(org.Hs.eg.db,
+                    keys = current_symbols,
+                    columns = c("ENSEMBL", "GENENAME"),
+                    keytype = "SYMBOL")
+
+# 3. Clean up the query (handle potential duplicates/NAs)
+# (Optional: remove duplicates if a symbol maps to multiple Ensembl IDs)
+gene_info <- gene_info[!duplicated(gene_info$SYMBOL), ]
+# keep non-NA only
+gene_info <- gene_info[!is.na(gene_info$ENSEMBL),]
+```
+
+### Gene Set Enrichment Analysis (GSEA)
+
+While Overrepresentation Analysis (ORA) treats gene lists as unranked sets, **Gene Set Enrichment Analysis (GSEA)** utilizes the full spectrum of gene expression changes. This allows for the detection of subtle but coordinated shifts in entire biological pathways that might be missed by simple threshold-based filtering.
+
+#### 1. Analysis Workflow: Ranking and Running
+For each experimental contrast, we performed the following steps:
+* **Gene Ranking:** All genes were ranked by their $log_2(\text{Fold Change})$ in descending order. This ensures that the most upregulated genes are at the "top" of the list and the most downregulated genes are at the "bottom."
+* **Enrichment Calculation:** Using the `clusterProfiler::GSEA` function, we calculated a running sum statistic to identify pathways where genes are non-randomly distributed at either end of the ranked list.
+
+#### 2. Key Metrics and "Core Enrichment"
+The results are summarized using two primary metrics:
+* **Normalized Enrichment Score (NES):** A positive NES indicates the pathway is generally **activated** (enriched in upregulated genes), while a negative NES indicates the pathway is **suppressed** (enriched in downregulated genes).
+* **Core Enrichment:** We extracted the specific subset of "leading-edge" genes—those that contribute most significantly to the enrichment score—and reported them along with their individual $log_2(\text{Fold Change})$ values.
+
+#### 3. Visualization and Export
+* **Summary Dotplots:** For each comparison, we visualized the top 10 activated and top 10 suppressed pathways. The size of the points represents the significance ($-\log_{10}(\text{Adjusted P-Value})$), and the x-axis indicates the NES.
+
+#### Output file
+Results are saved to GSEA_differential_expression_[geneset_name]_results.xlsx file, where each tab contains the results of one of the contrasts and only those genesets are listed for each contrast where the adjusted p value <= 0.05. If the enrichment process resulted no genesets, then the contrast is not shown in the file. If none of the genesets were significant, then the corresponding tab is empty.
+
+```{r GSEA for differentially expressed genes, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
+gsea_outer_list <- list()
+p_multi_list <- list()
+raw_gsea_models <- list()
+ for (gs_name in names(geneset_collections)){
+   current_t2g <- geneset_collections[[gs_name]]
+   
+    # add gene symbols
+    id_map <- current_t2g %>%
+    dplyr::select(ensembl_gene, gene_symbol) %>%
+    distinct() %>%
+      deframe() # Converts to a named vector
+   
+   # print("########################################")
+   # print(paste("#   Current gene set:", gs_name, "    #"))
+   # print("########################################")
+   gsea_res_list <- list()
+   # Iterate through your contrasts
+   # for (contr in colnames(fite$coefficients)) {
+   for (contr in c("EGFP_tumor_vs_SCP_virus", "MES_tumor_vs_ENF_virus", "EGFP_tumor_vs_MES_tumor")) {
+     # print(paste("Current contrast:", contr))
+
+     # 1. Prepare the ranked list for GSEA
+     full_stats <- topTable(fite, coef = contr, number = Inf)
+     full_tbl <- as_tibble(full_stats, rownames="SYMBOL")
+     # keep genes with ensembl id only
+     full_tbl <- inner_join(gene_info, full_tbl, by="SYMBOL")
+
+     # Create a named vector for GSEA ranking
+     gene_list <- full_tbl$logFC
+     names(gene_list) <- full_tbl$ENSEMBL
+     # remove_duplicated
+     keep <- which(!duplicated(names(gene_list)))
+     gene_list <- gene_list[keep]
+     
+
+     # Create a lookup for the table mapping (clean Ensembl IDs)
+     lfc_lookup <- full_stats$logFC
+     names(lfc_lookup) <- sub("\\..*$", "", rownames(full_stats))
+
+     # Sort for GSEA
+     gene_list <- sort(gene_list, decreasing = TRUE)
+
+     # 2. Run GSEA
+     gsea_out <- clusterProfiler::GSEA(
+       geneList = gene_list,
+       TERM2GENE = current_t2g[, c("gs_name", "ensembl_gene")],
+       pvalueCutoff = 0.05,
+       verbose = FALSE
+     )
+     
+     # store for later use
+     raw_gsea_models[[gs_name]] <- gsea_out
+
+     if (is.null(gsea_out) || nrow(as.data.frame(gsea_out)) == 0) {
+       next
+     }
+
+     # 3. Process results and map Symbols + LogFC
+     result_df <- as.data.frame(gsea_out)
+
+     # 4. Update the mapping logic to include LogFC for Core Enrichment
+     result_df_final <- result_df %>%
+       mutate(MSigDB_Link = paste0("<a href='https://www.gsea-msigdb.org/gsea/msigdb/cards/",
+                                   Description, "' target='_blank'>Link</a>")) %>%
+       mutate(core_enrichment_stats = map_chr(core_enrichment, function(id_string) {
+         # Split IDs (GSEA uses "/" as delimiter)
+         ids <- unlist(strsplit(id_string, "/"))
+
+         # Get Symbols from your id_map
+         symbols <- id_map[ids]
+         symbols[is.na(symbols)] <- ids[is.na(symbols)] # fallback to ID if symbol missing
+
+         # Get LogFC values from our lookup
+         # logfcs <- lfc_lookup[ids]
+         logfcs <- lfc_lookup[symbols]
+
+         # Format as "Symbol (LogFC)"
+         formatted <- paste0(symbols, " (", round(logfcs, 2), ")")
+
+         # Combine into a single string
+         paste(formatted, collapse = ", ")
+       })) %>%
+       # Select columns for the final table
+       dplyr::select(Description, NES, p.adjust, core_enrichment_stats, MSigDB_Link)
+
+     # Format p-value to scientific
+     result_df_final$p.adjust <- formatC(as.numeric(result_df_final$p.adjust), format = "e", digits = 2)
+     result_df_final$NES <- formatC(as.numeric(result_df_final$NES), format = "e", digits = 2)
+
+     # Add to list for Excel export
+     gsea_res_list[[contr]] <- result_df_final
+
+     # # 5. Create HTML Datatable (with the same JS logic for long text)
+     # html_table <- datatable(result_df_final,
+     #           escape = FALSE,
+     #           filter = 'top',
+     #           extensions = 'Buttons',
+     #           options = list(
+     #             pageLength = 10,
+     #             dom = 'Bfrtip',
+     #             buttons = c('copy', 'csv', 'excel'),
+     #             columnDefs = list(list(
+     #                 targets = 3, # Targets the core_enrichment_stats column
+     #                 width = '500px',
+     #                 render = JS(
+     #                   "function(data, type, row, meta) {",
+     #                   "return type === 'display' && data.length > 100 ?",
+     #                   "'<span title=\"' + data + '\">' + data.substr(0, 100) + '...</span>' : data;",
+     #                   "}"
+     #                 )
+     #             ))
+     #           ),
+     #           caption = paste("GSEA (Ranked by logFC):", contr))
+
+     # Save individual widget
+     #saveWidget(html_table, file.path(figfolder, paste0("GSEA_", contr, ".html")))
+
+     # also add a figure
+     if (!is.null(gsea_out) && nrow(as.data.frame(gsea_out)) > 0) {
+
+     # 1. Identify the top 3 pathways by absolute NES
+     # (You can change this to show the most significant or specific pathways of interest)
+     top_pathways <- as.data.frame(gsea_out) %>%
+       arrange(desc(abs(NES))) %>%
+       slice_head(n = 3) %>%
+       pull(ID)
+
+     # # 2. Generate the plot for the top pathway
+     # # p1: The Enrichment Score curve
+     # # p2: The gene 'ticks' (hits)
+     # # p3: The rank-ordered gene list gradient
+     # p_gsea <- gseaplot2(gsea_out,
+     #                     geneSetID = top_pathways[1],
+     #                     title = paste("Top Pathway:", top_pathways[1]),
+     #                     subplots = 1:3,
+     #                     pvalue_table = TRUE)
+     # 
+     # # 3. Save the plot as a high-resolution PDF or PNG
+     # # Since gseaplot2 returns a ggplot-compatible object, we use ggsave
+     # plot_filename <- file.path(figfolder, paste0("GSEA_Plot_", contr, ".pdf"))
+     # 
+     # ggsave(plot_filename,
+     #        plot = p_gsea,
+     #        width = 10,
+     #        height = 8,
+     #        dpi = 300,
+     #        bg = "white")
+
+     # Optional: Plot multiple top pathways together
+     p_multi <- enrichplot::gseaplot2(gsea_out,
+                          geneSetID = top_pathways,
+                          title = paste("Top 3 Pathways in", contr))
+     p_multi_wrapped <- patchwork::wrap_plots(p_multi, ncol = 1, heights = c(2, 0.5, 0.5))
+     # p_multi_list[[contr]] <- p_multi_wrapped
+     subfolder <- file.path(Figures, gs_name)
+     if (!file.exists(subfolder)) dir.create(subfolder)
+     ggsave(file.path(subfolder, paste0("GSEA_MultiPlot_", contr, "_SCP_EGFP_tumor_all_conditions.pdf")),
+            plot = p_multi, width = 12, height = 9)
+     }
+   }
+
+   # Write out to Excel
+   outfile_gsea <- file.path(Results, paste("GSEA_differential_expression_", gs_name, "_results_SCP_EGFP_tumor_all_conditions.xlsx", sep=""))
+   write.xlsx(gsea_res_list, file = outfile_gsea, colNames = TRUE)
+   gsea_outer_list[[gs_name]] <- gsea_res_list
+ }
+```
+
+
+```{r dotplot of GSEA results, fig.width=20, fig.height=20}
+for (gs_name in names(gsea_outer_list)){
+  gsea_res_list <- gsea_outer_list[[gs_name]]
+  plist <- list()
+  for (gsi in names(gsea_res_list)){
+    # create nice title:
+    gsi_title <- switch(gsi,
+      "EGFP_tumor_vs_SCP_virus"="EGFP ADRN-like vs SCP virus",
+      "MES_tumor_vs_ENF_virus"="MES tumor vs ENF virus",
+      gsi
+    )
+    clean_title <- paste(gs_name, gsi_title, sep = " - ")
+    clean_title <- gsub("_", " ", clean_title)
+    
+    y <- gsea_res_list[[gsi]]
+    
+    # select activated and supressed genesets
+    y$NES <- as.numeric(y$NES)
+    y$p.adjust <- as.numeric(y$p.adjust)
+    y$direction <- "activated"
+    y$direction[y$NES<=0] <- "suppressed"
+    numact <- length(which(y$direction=="activated"))
+    numsupp <- length(which(y$direction=="suppressed"))
+
+    # pick top and bottom genesets
+    act_Nvals <- y$NES[y$direction=="activated"]
+    act_thr <- sort(act_Nvals, decreasing = T)[min(10, numact)]
+    act_keep <- which(y$direction=="activated" & y$NES >= act_thr)
+    sup_Nvals <- y$NES[y$direction=="suppressed"]
+    sup_thr <- sort(sup_Nvals, decreasing = F)[min(15, numsupp)]
+    sup_keep <- which(y$direction=="suppressed" & y$NES <= sup_thr)
+    y <- y[c(act_keep, sup_keep),]
+    
+    # sort by normalized enrichment
+    y <- y[order(y$NES, decreasing = F),]
+    # change the names of the gene sets
+    #y$Description <- tolower(y$Description)
+    #y$Description <- gsub(prefix[gsi], "", y$Description) # later if needed prefix <- c("gobp_", "kegg_", "hallmark_")
+    y$Description <- gsub("_", " ", y$Description)
+    y$Description <- str_to_sentence(y$Description)
+    y$Description <- gsub("Gobp", "GO:BP", y$Description)
+    y$Description <- gsub("dna", "DNA", y$Description)
+    y$Description <- gsub("Dna", "DNA", y$Description)
+    y$Description <- str_wrap(y$Description, width = 50) # width=30 is a good starting point for a 4-column layout
+    #y$Description <- nice_names$name[match(y$Description, nice_names$compare)]
+    y$size <- -log10(as.numeric(y$p.adjust))
+    
+    num_suppressed <- sum(y$direction == "suppressed")
+    sep_line_pos <- num_suppressed + 0.5
+    y$Description <- factor(y$Description, levels=y$Description)
+      p <- ggplot(y, 
+                    aes(x = NES, y = Description)) + 
+               geom_point(aes(size = size, color = direction))+
+               scale_color_manual(values = c("activated" = "firebrick", "suppressed" = "dodgerblue4")) +
+               
+              scale_size_continuous(
+                 name = "-log10(p.adj)", 
+                 limits = c(0, 20),      # <--- This is the fixed range
+                 breaks = c(2, 4, 6, 8) # <--- Fixed circle sizes in legend
+               ) +  
+              
+              # Only add it if both directions exist to avoid errors
+             {if(num_suppressed > 0 && num_suppressed < nrow(y)) 
+               geom_hline(yintercept = sep_line_pos, linetype = "solid", color = "gray80", size = 0.5)} +
+              
+               guides(size=guide_legend(title="-log(p.adjust)", ncol=1,byrow=TRUE,
+                                title.vjust=0.9, order=1))+
+               theme_bw(base_size = 16) +
+
+               theme(
+                 axis.text.y = element_text(size = 16, lineheight = 0.8),
+                 panel.grid.minor = element_blank(),
+                 legend.position="right",
+                      legend.box = "vertical",
+                     #axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+                     #strip.background =element_rect(fill=cfill),
+                     strip.text = element_text(colour = 'black'),
+                 legend.title = element_text(size = 16), # Legend title size
+                  legend.text = element_text(size = 14)                 # Legend item text size)
+               )
+               ylab(NULL) + xlab("NES")+
+               #scale_size(range=c(3, 8))+
+               #scale_y_discrete(labels = function(x) str_wrap(x, width = 24))+
+               geom_vline(xintercept = 0, linetype="dashed")+
+               labs(title=clean_title)
+      #plot(p)
+      plist[[gsi]] <- p
+    # figfile <- file.path(figfolder, paste("GSEA_", gs_name, "_", gsi, "_enrich_dotplot.pdf", sep=""))
+    # ggsave(figfile, plot=p, width=14, height=6)
+      figfile <- file.path(Figures, paste0("GSEA_enrich_dotplot_combined_SCP_EGFP_tumor_all_conditions_", gs_name, "_", gsi, "_dotplot.pdf"))
+      ggsave(figfile, plot = p, width = 10, height = 7)
+  }
+  # plot together for the three genesets
+  # pp_combined <- patchwork::wrap_plots(plist, ncol = 1) + 
+  # patchwork::plot_layout(guides = "collect") & # Collects legends into one place
+  # theme(legend.position = "right")
+  # plot(pp_combined)
+  # ggsave(file.path(Figures, paste("GSEA_", gs_name, "_enrich_dotplot_combined_SCP_EGFP_tumor_all_conditions.pdf", sep="")), 
+  #        plot = pp_combined, width = 10, height = 10)
+}
+```

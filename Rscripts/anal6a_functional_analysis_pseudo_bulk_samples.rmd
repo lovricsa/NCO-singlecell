@@ -1,5 +1,5 @@
 ---
-title: "Analysis of single cell neuroblastoma organoids: part 2 - obtain cell type markers"
+title: "Analysis of single cell neuroblastoma organoids: part 6a - functional analysis"
 author: "Anna Lovrics"
 date: "`r Sys.Date()`"
 output:
@@ -25,63 +25,32 @@ The objective of this R Markdown code is to analyse the results obtained by the 
 
 ```{r libraries}
 knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
-# # install CRAN packages via BioConductor as well
-# if (!"BiocManager" %in% installed.packages()[,"Package"]){
-#   install.packages("BiocManager")
-# }
-# list.of.packages <- c("ggplot2", "ComplexHeatmap", "tidyHeatmap", 
-#                       "circlize", "limma", "edgeR", "dplyr", "tidyr",
-#                       "UpSetR", "ComplexUpset", "VennDiagram", "readr", "openxlsx", "readxl", 
-#                       "ggmagnify", "readr", "ggrepel")
-# new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
-# if(length(new.packages)) BiocManager::install(new.packages)
 
-library(Seurat)
-library(DoubletFinder) # for doublet detection
-library(scDblFinder) # a newer doublet detection tool
-library(SeuratWrappers)
-library(monocle3)
-library(ggplot2)
-library(patchwork) # to combine plots
-library(ggforce) # to add ellipse?
-library(Matrix)
-library(dplyr)
-library(here)
-library(stringr) # for the string replacements
-library(future) # for parallel Seurat runs
-library(clustree) # to visualize clusters
-library(scCustomize) # use scVI for integration, such as in Saldana-Guerero
-library(RColorBrewer)
-# for concave hulls:
-library(ggforce)
-library(concaveman)
-library(openxlsx)
-library(future) # in this case to stop parallelization
+packages <- c(
+  "knitr",
+  "Seurat",
+  "ggplot2",
+  "patchwork",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "here",
+  "stringr",
+  "openxlsx",
+  "limma",
+  "edgeR",
+  "msigdbr",
+  "clusterProfiler",
+  "enrichplot",
+  "EnhancedVolcano",
+  "pathview",
+  "AnnotationDbi",
+  "org.Hs.eg.db",
+  "enrichplot"
+)
+invisible(lapply(packages, library, character.only = TRUE))
 
-library(limma)
-library(edgeR) # both for pseudo-bulk analysis
-# for differential expression analysis
-library(DESeq2)
-library(SummarizedExperiment)
-library(tidyverse)
-library(here) # Excellent for path construction
-library(biomaRt) # for Ensembl ID harmonization
-library(EnhancedVolcano)
 
-# for TPM calculation
-#library(GenomicFeatures)
-#library(TxDb.Hsapiens.UCSC.hg38.knownGene) # not working!
-
-# for functional analysis and output
-library(msigdbr)
-library(clusterProfiler)
-library(dplyr)
-library(DT)
-library(htmlwidgets)
-library(htmltools)
-
-# for pathview
-library(pathview)
 ```
 
 
@@ -91,25 +60,17 @@ library(pathview)
 
 Folder structure
 ```{r}
-# dtype <- "length92"
-dtype <- "length151"
-projpath <- here()
-Datafolder <- file.path(sub(pattern = "Rscripts", replacement = "Results",
-                         x=projpath), dtype)
-Figures <- file.path(sub(pattern = "Rscripts", replacement = "Figures",
-                         x=projpath), dtype)
-if (!file.exists(Figures)) dir.create(Figures, recursive = T)
-Data_calc <- file.path(sub(pattern = "Rscripts", replacement = "Data_calculated",
-                           x=projpath), dtype)
-if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = T)
-Data_public <- sub(pattern = "Rscripts", replacement = "Data_public",
-                           x=projpath)
-Results <- file.path(sub(pattern = "Rscripts", replacement = "Results_local",
-                         x=projpath), dtype)
-if (!file.exists(Results)) dir.create(Results, recursive = T)
+Datafolder     <- here("Data")
+Figures   <- here("Figures/pseudobulk_functional_analysis")
+Data_calc <- here("Data_calculated") # Path to find previous outputs
+Results   <- here("Results")
 
-utils_file <- file.path(projpath, "utils.R")
-source(utils_file)
+if (!file.exists(Figures))   dir.create(Figures, recursive = TRUE)
+if (!file.exists(Data_calc)) dir.create(Data_calc, recursive = TRUE)
+if (!file.exists(Results))   dir.create(Results, recursive = TRUE)
+
+utils_file <- here("Rscripts","utils.R")
+if (file.exists(utils_file)) source(utils_file)
 ```
 
 
@@ -125,7 +86,7 @@ for (ct in c("EpiC", "kolf2")){
   
     # outfile <- file.path(Data_calc, paste("seu_integrated_clusters_", ct, "_all_nHVG", nHVG_str, ".rds", sep=""))
     # use the new cluster names
-    outfile <- file.path(Data_calc, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep="")) # it was created in anal3
+    outfile <- file.path(Results, paste("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds", sep="")) # it was created in anal3
     seu.integrated <- LoadSeuratRds(outfile)
     # write out cell numbers
     table(seu.integrated$sample.names)
@@ -185,9 +146,17 @@ exprmx <- as_tibble(vv$E, rownames = "gene_symbol")
 exprfile <- file.path(Results, "ps_bulk_logCPM.xlsx")
 write.xlsx(exprmx, file = exprfile, colNames=T, rowNames=F)
 
+# add samples names dictionary for later figures
+sample_names_dict <- c(
+  "g3-EpiC-STOP-MYCN-D42" = "H1 STOP-MYCN no virus D42",
+  "g4-EpiC-STOP-MYCN-D42-hTH" = "H1 STOP-MYCN hTH-Cre D42",
+  "g7-kolf2-STOP-MYCN-D42" = "H2 STOP-MYCN no virus D42",
+  "g8-kolf2-STOP-MYCN-D42-hTH" = "H2 STOP-MYCN hTH-Cre D42"
+)
+
 ```
 
-The distribution of normalised expressions provides a snapshot of the gene expression in each sample. Notice, that the mean gene expression is higher in the UPS samples.
+The distribution of normalised expressions provides a snapshot of the gene expression in each sample.
 ```{r plot normalised expression of samples}
 # for the boxplot, create a long tibble first
 exprmx_long <- pivot_longer(exprmx, !c(gene_symbol),
@@ -282,11 +251,18 @@ nicelabels <- paste0("PC", 1:maxi, " (", vardf$variance, "%)")
 pca_df <- as_tibble(pca$x, rownames = "sample")
 pca_annot <- inner_join(pca_df, sample_annot, by=join_by(sample))
 
-p <- ggplot(pca_annot, aes(x = PC1, y = PC2, shape = cell_line, color = condition,
+# add nice names for plot
+pca_annot <- pca_annot %>% 
+  mutate(sample_nice = recode(sample, !!!sample_names_dict))
+pca_annot$cell_line_nice <- limma::strsplit2(pca_annot$sample_nice, split=" ")[,1]
+
+p <- ggplot(pca_annot, aes(x = PC1, y = PC2, shape = cell_line_nice, color = condition,
                            text = paste("Sample:", sample, "<br>Group:", condition))) +
   geom_point(size = 3) +
   theme_gray(base_size = 18) + 
-  scale_color_manual(values = c("tumor"="red", "normal"="darkblue"))+
+  scale_shape(name = "Cell Line")+
+  scale_color_manual(name="Condition",
+    values = c("tumor"="red", "normal"="darkblue"))+
   xlab(nicelabels[[1]])+ylab(nicelabels[[2]])
   # geom_text(aes(label=Type_Exp), size = 2.5, vjust =  2.5)
 print(p)
@@ -295,20 +271,6 @@ print(p)
 outfig <- file.path(Figures, "pca_samples.pdf")
 ggsave(outfig, plot=p, height = 20, width= 30, units = "cm")
 
-# # create interactive figure
-# # tooltip = "text" ensures only your custom label shows up on hover
-# ggplotly(p, tooltip = "text")
-# 
-# # plot B16 only
-# p <- ggplot(pca_annot[pca_annot$Cancer=="B16",], aes(x = PC1, y = PC2, shape = Cancer, color = Type)) +
-#   geom_point(size = 3) +
-#   theme_gray(base_size = 18) + 
-#   scale_color_manual(values=c("tumor"="red", "X"="darkblue"))+
-#   xlab(nicelabels[[1]])+ylab(nicelabels[[2]])+
-#   geom_text(aes(label=Type_Exp), size = 2.5, vjust =  2.5)
-# #plot(p)
-# outfig <- file.path(figfolder, "pca_samples_B16only.pdf")
-# ggsave(outfig, plot=p, height = 20, width= 30, units = "cm")
 ```
 
 
@@ -316,26 +278,6 @@ ggsave(outfig, plot=p, height = 20, width= 30, units = "cm")
 
 Differential Gene Expression (DGE) was performed to identify transcriptomic shifts across various biological states. For all comparisons, **upregulated** genes are defined as those with significantly higher expression in the second condition of the contrast, while **downregulated** genes are those with significantly lower expression.
 
-### 1. Primary Experimental Contrasts
-The following core comparisons were evaluated:
-
-* **UPS vs. X ($UPS\_vs\_X$):** Quantifies expression changes transitioning from the UPS state to the X state.
-* **Tumor vs. X:** Quantifies expression changes transitioning from the tumor state to the X state
-* **UPS vs. Tumor:** Compares the baseline UPS state against the tumor environment.
-
-### 2. Scope of Comparison (Prefixes)
-The prefixes **MEC**, **B16**, or **both** define the samples included in the analysis:
-
-* **MEC / B16:** The comparison is restricted to samples within that specific cancer type.
-* **both:** Samples from both cancer types are aggregated. 
-    * *Note:* The statistical model utilizes weighting or averaging to account for the unbalanced sample sizes between the B16 and MEC groups, ensuring neither group disproportionately influences the "both" results.
-
-### 3. Sequential Comparisons (B16)
-For the B16 samples pairwise comparisons were conducted between sub-conditions:
-
-* **X2 vs. X1**
-* **X3 vs. X2**
-* **X1 vs. X3**
 
 ### Output file
 Results are saved to diffexpr_all.xlsx and diffexpr_lfc1_adjp0.05_signif.xlsx files, where each tab contains the results of one of the above contrasts. In diffexpr_lfc1_adjp0.05_signif.xlsx only genes are listed for each contrast whose expression changed with at least 1 log fold change and adjusted p value <= 0.05.
@@ -344,12 +286,6 @@ Results are saved to diffexpr_all.xlsx and diffexpr_lfc1_adjp0.05_signif.xlsx fi
 
 # 5. Fit the linear model
 fit <- lmFit(vv, design)
-contrast.matrix <- makeContrasts(
-  TumorVsNormal = conditiontumor,
-  Kolf2VsEpiC   = cell_linekolf2 - cell_lineEpiC,
-  levels = design
-)
-
 # contrasts 
 contrast.matrix <- makeContrasts(
   TumorVsNormal = conditiontumor,
@@ -406,10 +342,10 @@ for (cf in colnames(fite$coefficients)){
   outdata_signif[[lname]] <- toptt_thr
 }
 # write into a compound excel file
-outfile <- file.path(Results, "diffexpr_all.xlsx")
+outfile <- file.path(Results, "diffexpr_pseudobulk_all.xlsx")
 write.xlsx(outdata, file = outfile, colNames=T, rowNames=F)
-outfile_signif <- outfile <- file.path(Results, 
-                     paste("diffexpr_", thrchar, "_signif.xlsx", sep=""))
+outfile_signif <- file.path(Results, 
+                     paste("diffexpr_pseudobulk_", thrchar, "_signif.xlsx", sep=""))
 write.xlsx(outdata_signif, file = outfile_signif, colNames=T, rowNames=F)
 
 # add volcano plot
@@ -446,15 +382,9 @@ We utilized three distinct categories of gene sets to capture a broad range of b
 * **KEGG Medicus:** A subset of the Kyoto Encyclopedia of Genes and Genomes (KEGG) that focuses on the molecular networks of diseases and drug mechanisms, offering a more clinical and mechanistic perspective.
 * **GO Biological Process (GO:BP):** Comprehensive ontologies that describe the broader biological objectives (such as cell cycle or metabolic pathways) to which a gene contributes.
 
-<!-- ### 2. Implementation and Mapping -->
-<!-- The analysis was performed using "native" mouse gene sets (species: *Homo sapiens*) via the `msigdbr` package. To ensure high-confidence mapping across different data formats, gene sets were structured to include both: -->
-<!-- * **Gene Symbols:** Standardized nomenclature for biological interpretation. -->
-<!-- * **Ensembl IDs:** Stable identifiers for precise cross-referencing with the expression matrix. -->
-
 This multi-faceted approach allows us to determine if the genes identified as "changing" or "stable" are non-randomly associated with specific biological functions or signaling pathways.
 
 ```{r functional analysis, message=FALSE, warning=FALSE}
-# mouse native gene sets: db_species = "MM" (other option: human MSigDB with ortholog mapping to mouse)
 geneset_collections <- list(
   Hallmark = msigdbr(species = "Homo sapiens", collection = "H") %>%
              dplyr::select(gs_name, gene_symbol, ensembl_gene),
@@ -471,9 +401,6 @@ geneset_collections <- list(
 
 # Create gene annotation
 ```{r}
-library(org.Hs.eg.db) # Or org.Mm.eg.db for mouse
-library(AnnotationDbi)
-
 # 1. Get your list of gene symbols from the object
 current_symbols <- rownames(seu.integrated)
 
@@ -673,7 +600,7 @@ raw_gsea_models <- list()
    }
 
    # Write out to Excel
-   outfile_gsea <- file.path(Results, paste("GSEA_differential_expression_", gs_name, "_results.xlsx", sep=""))
+   outfile_gsea <- file.path(Results, paste("GSEA_differential_expression_pseudobulk_", gs_name, "_results.xlsx", sep=""))
    write.xlsx(gsea_res_list, file = outfile_gsea, colNames = TRUE)
    gsea_outer_list[[gs_name]] <- gsea_res_list
  }
@@ -708,7 +635,7 @@ for (gs_name in names(gsea_outer_list)){
     act_thr <- sort(act_Nvals, decreasing = T)[min(10, numact)]
     act_keep <- which(y$direction=="activated" & y$NES >= act_thr)
     sup_Nvals <- y$NES[y$direction=="suppressed"]
-    sup_thr <- sort(sup_Nvals, decreasing = F)[min(10, numsupp)]
+    sup_thr <- sort(sup_Nvals, decreasing = F)[min(20, numsupp)]
     sup_keep <- which(y$direction=="suppressed" & y$NES <= sup_thr)
     y <- y[c(act_keep, sup_keep),]
     
@@ -758,7 +685,7 @@ for (gs_name in names(gsea_outer_list)){
                      strip.text = element_text(colour = 'black'),
                  legend.title = element_text(size = 16), # Legend title size
                   legend.text = element_text(size = 14)                 # Legend item text size)
-               )
+               )+
                ylab(NULL) + xlab("NES")+
                #scale_size(range=c(3, 8))+
                #scale_y_discrete(labels = function(x) str_wrap(x, width = 24))+
@@ -774,11 +701,11 @@ for (gs_name in names(gsea_outer_list)){
   patchwork::plot_layout(guides = "collect") & # Collects legends into one place
   theme(legend.position = "right")
   plot(pp_combined)
-  ggsave(file.path(Figures, paste("GSEA_", gs_name, "_enrich_dotplot_combined.pdf", sep="")), 
+  ggsave(file.path(Figures, paste("GSEA_pseuodobulk_", gs_name, "_enrich_dotplot_combined.pdf", sep="")), 
          plot = pp_combined, width = 10, height = 10)
 }
 ```
-library(enrichplot)
+
 
 ```{r}
 # Extract the raw clusterProfiler GSEA object specifically for Hallmark
@@ -796,7 +723,7 @@ enrichplot::gseaplot2(hallmark_gsea_obj,
 contr <- "TumorVsNormal"
 full_stats <- topTable(fite, coef = contr, number = Inf)
 full_stats_tbl <- as_tibble(full_stats, rownames="SYMBOL")
-id_tibble$ENSEMBL <- names(id_map)
+id_tibble <- as_tibble(id_map, rownames="ENSEMBL")
 full_stats_tbl <- inner_join(full_stats_tbl, id_tibble, by=c("SYMBOL"="value"))
 
 # gene_logfc_vector <- setNames(full_stats_tbl$logFC, full_stats_tbl$ENSEMBL)
