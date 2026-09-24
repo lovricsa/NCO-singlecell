@@ -30,10 +30,6 @@ The objective of this R Markdown code is to analyse the results obtained by the 
 Follow steps in readme to create Python environment for scVI integration
 
 ```{r libraries}
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages("BiocManager")
-}
-
 packages <- c(
   "Seurat",
   "ggplot2",
@@ -50,13 +46,6 @@ packages <- c(
   "FNN"
 )
 
-# TO DO: list packages in readme
-# missing <- setdiff(packages, rownames(installed.packages()))
-# 
-# # # install CRAN packages via BioConductor as well
-# if (length(missing) > 0) {
-#   BiocManager::install(missing, ask = FALSE)
-# }
 invisible(lapply(packages, library, character.only = TRUE))
 ```
 

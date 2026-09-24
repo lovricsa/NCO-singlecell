@@ -4,8 +4,10 @@ Data_public/
 Figures/
 Results/
 scvi-env/
+scvi-requirements.txt
 *.html
 .Rhistory
 .RData
 .Rproj.user
-*_old
+*_old*
+*/*_old*
