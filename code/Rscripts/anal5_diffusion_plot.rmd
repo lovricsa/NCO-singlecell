@@ -1,0 +1,403 @@
+---
+title: "Analysis of single cell neuroblastoma organoids: part 5 - pseudotime analysis"
+author: "Anna Lovrics"
+date: "`r Sys.Date()`"
+params:
+  ct: "EpiC"
+output:
+  html_document:
+    # css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+The objective of this R Markdown code is to analyse the results obtained by the single cell RNA sequencing.
+
+```{r libraries}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+packages <- c(
+  "Seurat",       
+  "scDblFinder",  
+  "ggplot2",
+  "patchwork",           
+  "plotly",              
+  "ggforce",             
+  "Matrix",
+  "dplyr",
+  "here",
+  "stringr",             
+  "future",              
+  "scCustomize",    
+  "openxlsx",
+  "destiny",
+  "SingleCellExperiment",
+  "slingshot",
+  "viridis"
+)
+invisible(lapply(packages, library, character.only = TRUE))
+
+```
+
+This part reconstructs differentiation trajectories at day 42 (virus condition) with diffusion maps
+(first 18 PCs of the stored PCA) and slingshot pseudotime. Diffusion plot 1 covers the SCP to
+sympathoadrenal/EGFP ADRN-like populations (start: late SCP). Diffusion plot 2 covers the
+fibroblast/MES-like populations (start: late/early endoneural fibroblast).
+
+**Run modes.** The diffusion-map eigenvectors depend on a random solver start, so their orientation
+can differ between runs and package versions. In `published` mode (default) the stored diffusion
+coordinates from `data/Published_objects/` are used; slingshot and all plots are recomputed from them.
+In `rerun` mode the diffusion maps are recomputed (results in `results/rerun/`) and axes may be mirrored.
+
+Folder structure
+```{r}
+on_codeocean <- dir.exists("/data") && dir.exists("/code")
+if (on_codeocean) {
+  utils_file  <- "/code/Rscripts/utils.R"
+  config_file <- "/code/Rscripts/config.R"
+} else {
+  utils_file  <- here("code/Rscripts/utils.R")
+  config_file <- here("code/Rscripts/config.R")
+}
+if (file.exists(config_file)) source(config_file)   # run_mode, out_root, published_dir, ...
+if (file.exists(utils_file))  source(utils_file)
+
+message("run_mode = ", run_mode)
+use_cached <- run_mode == "published"
+
+Results   <- file.path(out_root, "Results")
+Figures   <- file.path(out_root, "Figures", "diffusion_plot")
+Data_calc <- file.path(out_root, "Data_calculated")
+dirs <- c(Results, Figures)
+if (!use_cached) dirs <- c(dirs, Data_calc)
+for (d in dirs) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+ct <- params$ct
+```
+
+
+
+# Parameters 
+```{r}
+# to always have the same parameters 
+set.seed(2)
+
+# Specific for HPC to make plots
+options(bitmapType = "cairo")
+
+day <- "D42_hTH"
+```
+
+```{r cache mode}
+# Diffusion components are cached, because the eigen-solver is random and signs can flip.
+# published: read-only from Published_objects (this script never writes there).
+# rerun:     recompute and save in this run's Data_calc.
+get_DC <- function(emb, key) {
+  fname <- paste0("diffusion_DC_", key, "_", ct, ".rds")
+
+  if (use_cached) {
+    pub <- file.path(published_dir, fname)
+    if (!file.exists(pub)) stop("Missing cached diffusion map: ", pub)
+    dc <- readRDS(pub)
+    stopifnot("cells differ from cached diffusion map" = setequal(rownames(dc), rownames(emb)))
+    return(dc[rownames(emb), , drop = FALSE])
+  }
+
+  set.seed(2)
+  dm <- destiny::DiffusionMap(emb)
+  dc <- destiny::eigenvectors(dm)[, 1:4]
+  rownames(dc) <- rownames(emb)
+  colnames(dc) <- paste0("DC", 1:4)
+  dir.create(Data_calc, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(dc, file.path(Data_calc, fname))
+  dc
+}
+```
+
+
+# Diffusion plot
+```{r main}
+start_cluster_lookup <- list(
+  "kolf2" = "late SCP",      
+  "EpiC"  = "late SCP"
+)
+
+plot2d_list <- list("kolf2"=list(), "EpiC"=list())
+slingshot_plot_list  <- list("kolf2"=list(), "EpiC"=list())
+
+outfile <- file.path(Results, paste0("seu_integrated_clusters_newnames_", ct, "_all_nHVG", nHVG_str, ".rds"))
+stopifnot("run part 3 first" = file.exists(outfile))
+seu.integrated <- LoadSeuratRds(outfile)
+# for the nice plots, remove "type_12" cluster
+seu.integrated <- subset(seu.integrated, subset = !cluster_type %in% c("type_12"))
+seu.integrated$cluster_type <- droplevels(seu.integrated$cluster_type)
+# write out cell numbers
+table(seu.integrated$sample.names, seu.integrated$cluster_type)
+    
+  # now select the sample
+  #for (day in day_options){
+    # initialize lists
+    plot2d_list[[ct]][[day]] <- list()
+    slingshot_plot_list[[ct]][[day]] <- list()
+    seu.day <- subset_seu_by_day(seu.integrated, day)
+    
+    # drop unused levels - do it everywhere!!!
+    cluster_sizes <- table(seu.day$cluster_type)
+    keep_clusters <- names(cluster_sizes[cluster_sizes >= drop_clusters])
+    seu.day <- subset(seu.day, subset = cluster_type %in% keep_clusters)
+    if (day=="D42_hTH"){
+      seu.day <- subset(seu.day, subset = !cluster_type %in% drop_in_hTH)
+    }
+    
+    # set up the order
+    bio_order <- bio_order_list[[ct]]
+    seu.day$cluster_type <- droplevels(seu.day$cluster_type)
+   
+    # use new names
+    actual_day <- limma::strsplit2(day, "_")[[1]]
+    
+    # # Rename clusters from previous annotation
+    # if (actual_day %in% names(cluster_names_dict[[ct]])){
+    #       new_cluster_ids <- dplyr::recode(
+    #     as.character(seu.day$cluster_type),
+    #     !!!cluster_names_dict[[ct]][[actual_day]]
+    #   )
+    #   # Preserve cluster order
+    #   renamed_cluster_order <- unique(dplyr::recode(
+    #     bio_order,
+    #     !!!cluster_names_dict[[ct]][[actual_day]]
+    #   ))
+    #   
+    #   new_cluster_ids <- factor(
+    #     new_cluster_ids,
+    #     levels = renamed_cluster_order
+    #   )
+    #   
+    #   # Store back into Seurat object and construct final legend text
+    #   seu.day$cluster_type_renamed <- new_cluster_ids
+    #   Idents(seu.day) <- "cluster_type_renamed"
+    # }
+    
+    dic <- names(cluster_names_dict[[ct]][[actual_day]])
+    stopifnot("no dictionary for this day" = !is.null(dic))
+    lv <- levels(seu.day$cluster_type)
+    if (length(setdiff(lv, dic)) || length(setdiff(lv, bio_order_list[[ct]])))
+      stop("labels not covered: ", paste(union(setdiff(lv, dic), setdiff(lv, bio_order_list[[ct]])), collapse = ", "))
+    new_cluster_ids <- dplyr::recode(as.character(seu.day$cluster_type), !!!cluster_names_dict[[ct]][[actual_day]])
+    renamed_cluster_order <- unique(dplyr::recode(bio_order_list[[ct]], !!!cluster_names_dict[[ct]][[actual_day]]))
+    new_cluster_ids <- factor(new_cluster_ids, levels = renamed_cluster_order)
+    stopifnot("cells lost to NA" = !anyNA(new_cluster_ids))
+    seu.day$cluster_type_renamed <- new_cluster_ids
+    Idents(seu.day) <- "cluster_type_renamed"
+    
+    # drop unused levels
+    seu.day$cluster_type_renamed <- droplevels(seu.day$cluster_type_renamed)
+    print(table(seu.day$cluster_type_renamed))
+      
+      # Process the results
+      cat("\nProcessing Day:", day, "\n")
+      print(table(seu.day$sample.names))
+      
+      # select desired clusters
+      # seu.day <- switch(ct,
+      #                   "kolf2" = subset(seu.day, subset= num_id_D42_hTH %in% c("3", "4", "5", "7") ),
+      #                   "EpiC"= subset(seu.day, subset= num_id_D42_hTH %in% c("0", "1", "7", "8"))
+      # )
+      
+      seu.day <- switch(ct,
+                        "kolf2" = subset(seu.day, subset= cluster_type_renamed %in% c("early SCP", "late SCP", "chromaffin", "sympathoblast", "bridging", "EGFP ADRN-like") ),
+                        "EpiC"= subset(seu.day, subset= cluster_type_renamed%in% c("late SCP", "chromaffin/sympathoblast", "sympathoblast", "bridging", "EGFP ADRN-like"))
+      )
+      #table(seu.day$cluster_type_renamed_D42_hTH)
+      
+      
+      # drop unused levels
+      seu.day@meta.data <- droplevels(seu.day@meta.data)
+      table(seu.day$cluster_type)
+      
+      # need to be a matrix
+      sce <- as.SingleCellExperiment(seu.day)
+      
+      # warning is not a problem - diffusion map will be run on the pca component
+      # other warnings -> check!
+      all(rownames(seu.day@reductions$pca@cell.embeddings) == colnames(seu.day))
+      dim(Embeddings(seu.day, "pca")[,1:20])
+      
+      # # Dim 18
+      # dm_S <- DiffusionMap(Embeddings(seu.day, "pca")[,1:18])
+      # 
+      # #cellLabels <- sce$cluster_type
+      # cellLabels <- sce$cluster_type_renamed
+      # tmp <- data.frame(DC1 = eigenvectors(dm_S)[, 1],
+      #                   DC2 = eigenvectors(dm_S)[, 2],
+      #                   DC3 = eigenvectors(dm_S)[, 3],
+      #                   DC4 = eigenvectors(dm_S)[, 4],
+      #                   Clusters = cellLabels)
+      
+      dc <- get_DC(Embeddings(seu.day, "pca")[, 1:18], key = "main")   # "MES" in the second chunk
+
+      cellLabels <- sce$cluster_type_renamed
+      tmp <- data.frame(DC1 = dc[, 1], DC2 = dc[, 2], DC3 = dc[, 3], DC4 = dc[, 4],
+                        Clusters = cellLabels)
+      
+      p2d <- ggplot(tmp, aes(x = DC1, y = DC2, color = Clusters)) +
+        geom_point()  + 
+        xlab("Diffusion component 1") + 
+        ylab("Diffusion component 2") +
+        theme_classic() 
+      plot2d_list[[ct]][[day]] <- p2d
+      ggsave(file.path(Figures, paste("Diffusion_plot_", ct, "_day_", day,
+                            "_nHVG", nHVG_str,".pdf", sep="")), p2d, width = 6,   height = 6)
+      
+      # 1. Create the 3D plot
+      p3d <- plot_ly(tmp, x = ~DC1, y = ~DC2, z = ~DC3, 
+                     color = ~Clusters, 
+                     colors = "Set1", # You can change this to any color palette
+                     type = "scatter3d", 
+                     mode = "markers",
+                     marker = list(size = 7)) %>%
+        layout(scene = list(xaxis = list(title = 'Diffusion Component 1'),
+                            yaxis = list(title = 'Diffusion Component 2'),
+                            zaxis = list(title = 'Diffusion Component 3')),
+                             font = list(size = 14),              
+                                  legend = list(
+                                    font = list(size = 18),            # Legend font size
+                                    itemsizing = "constant"))
+      # 2. Save the plot as an interactive HTML file
+      htmlwidgets::saveWidget(as_widget(p3d), 
+                             file.path(Figures, paste0("Diffusion_plot_3D_", ct, "_day_", day, ".html")))
+      
+      # 3. If you want to view it immediately in RStudio:
+      # p3d
+      
+      
+      # add pseudotime analysis
+      # Add DC components in the seurat object - I have worked with your diffusion map components because of the two nice lineages 
+    #dimentions_DC <- cbind(dm_S$DC1, dm_S$DC2, dm_S$DC3, dm_S$DC4)
+    dimentions_DC <- dc
+    colnames(dimentions_DC) <- c("Diffusion Component 1", 
+                                 "Diffusion Component 2", 
+                                 "Diffusion Component 3",
+                                 "Diffusion Component 4")
+    
+    seu.day[["DC"]] <- CreateDimReducObject(embeddings = dimentions_DC, key = "DC_", assay = DefaultAssay(seu.day))
+    DimPlot(seu.day, reduction = "DC")
+
+    # transform again to add the new metadata
+    sce <- as.SingleCellExperiment(seu.day)
+    current_start <- start_cluster_lookup[[ct]]
+    # slingshot function with DC as reduction 
+    # sce_slingshot <- slingshot(sce, clusterLabels = "cluster_type", reducedDim = "DC", 
+    #                            start.clus = "type_early_prog", omega = TRUE)
+    sce_slingshot <- slingshot(sce, 
+                               #clusterLabels = "cluster_type", 
+                               clusterLabels = "cluster_type_renamed",
+                               reducedDim = "DC", 
+                               start.clus = current_start, # Fixed here!
+                               omega = TRUE)
+    num_lineages <- length(SlingshotDataSet(sce_slingshot)@lineages)
+    print(num_lineages)
+    # print summary
+    SlingshotDataSet(sce_slingshot)
+    
+    #summary(sce_slingshot$slingPseudotime_1)
+    
+    # Make this avaible for a ggplot! 
+    df_sce <- as.data.frame(reducedDims(sce_slingshot)$DC)
+    
+    # plot in a loop
+    for (i in 1:num_lineages) {
+  
+      # Dynamically pull the pseudotime vector for lineage i
+      pseudotime_col <- paste0("slingPseudotime_", i)
+      df_sce$current_pseudotime <- sce_slingshot[[pseudotime_col]]
+      
+      # add clusters as well
+      #df_sce$Cluster <- sce_slingshot$cluster_type
+      #df_sce$Cluster <- sce_slingshot$cluster_type
+      df_sce$Cluster <- sce_slingshot$cluster_type_renamed
+      
+            # --- NEW: Calculate and print summary statistics ---
+      stats <- df_sce %>%
+        filter(!is.na(current_pseudotime)) %>% # Exclude cells not on this lineage
+        group_by(Cluster) %>%
+        summarise(
+          Mean_Pseudotime   = mean(current_pseudotime),
+          Median_Pseudotime = median(current_pseudotime),
+          SD_Pseudotime     = sd(current_pseudotime),
+          Cell_Count        = n()
+        )
+      
+      cat("\n=========================================\n")
+      cat("  Summary Stats for Lineage", i, "(", ct, "-", day, ")\n")
+      cat("=========================================\n")
+      print(stats)
+      
+      # Generate the plot
+      p <- ggplot(df_sce, aes(x = DC_1, y = DC_2, color = current_pseudotime)) + 
+        geom_point() + 
+        theme_classic() + 
+        scale_color_viridis(na.value = "lightgray") + # Cells not on this lineage turn gray
+        ggtitle(paste("Pseudotime Lineage", i)) +
+        xlab("Diffusion component 1") +
+        ylab("Diffusion component 2") +
+        labs(color = "Pseudotime")
+      
+      # # Save the plot dynamically
+      # file_name <- paste0("Slingshot_plot_Lineage", i, "_", ct, "_day_", day, "_nHVG", nHVG_str, ".pdf")
+      # ggsave(file.path(Figures, file_name), p, width = 6, height = 6)
+      
+      # Store it in your nested tracking list dynamically
+      slingshot_plot_list[[ct]][[day]][[paste0("lineage_", i)]] <- p
+      
+      # p_box <- ggplot(subset(df_sce, !is.na(current_pseudotime)), 
+      #             aes(x = Cluster, y = current_pseudotime)) +
+      #   geom_boxplot(aes(fill = Cluster), alpha = 0.7, show.legend = FALSE) +
+      #   theme_bw() +
+      #   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      #   labs(y = "Pseudotime", x = "Cluster", title = paste("Lineage", i, "Distribution"))
+      # 
+      # # Print it to the screen as it loops through
+      # plot(p_box)
+      # slingshot_plot_list[[ct]][[day]][["boxplot"]] <- p_box
+      
+    }
+    # add names of clusters
+    slingshot_plot_list[[ct]][[day]][["clusters"]] <- plot2d_list[[ct]][[day]]
+    # plot the lineage plots together as well
+    combined_plot <-  wrap_plots(slingshot_plot_list[[ct]][[day]], nrow = 1) + 
+    plot_annotation(
+      #title = paste("Slingshot Pseudotime Lineages -", ct, day),
+      #subtitle = paste("Total lineages found:", num_lineages),
+      theme = theme(plot.title = element_text(size = 14, face = "bold"))
+    )
+    # Save the master combined plot
+    combined_file_name <- paste0("Slingshot_combined_", ct, "_day_", day, "_nHVG", nHVG_str, ".pdf")
+    ggsave(
+      filename = file.path(Figures, combined_file_name), 
+      plot = combined_plot, 
+      # width = 10, 
+      # height = ceiling((num_lineages+1) / 2) * 4.5
+      width = 5*(num_lineages+1), 
+      height = 4.5
+    )
+  #} # loop for day
+#} # loop for cell type
+
+```
+
+Session info for reproducibility
+```{r session info}
+sessionInfo()
+```

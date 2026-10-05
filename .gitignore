@@ -1,0 +1,9 @@
+data/
+results/
+tmp/
+*/*old
+*tmp*
+*.html
+.Rhistory
+.RData
+.Rproj.user
