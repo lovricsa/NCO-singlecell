@@ -89,16 +89,16 @@ step() {
 
 # ---- pipeline (sequential: later steps depend on earlier ones) --------------
 step 0  anal0_index_hopping
-#step 1  anal1_quality_control
-#step 2  anal2_integration_and_markers
-#step 3a anal3a_save_selected_resolution
-#step 3b anal3b_plot_selected_resolution                        per_ct
-#step 4  anal4_reference_mapping                                per_ct
-#step 5  anal5_diffusion_plot                                   per_ct
-#step 6a anal6a_functional_analysis_pseudo_bulk_samples
-#step 6b anal6b_functional_analysis_pseudo_bulk_SCP_EGFP_tumor
-#step 7  anal7_cell_chat                                        per_ct
-#step 7b anal7b_cell_chat_public
+step 1  anal1_quality_control
+step 2  anal2_integration_and_markers
+step 3a anal3a_save_selected_resolution
+step 3b anal3b_plot_selected_resolution                        per_ct
+step 4  anal4_reference_mapping                                per_ct
+step 5  anal5_diffusion_plot                                   per_ct
+step 6a anal6a_functional_analysis_pseudo_bulk_samples
+step 6b anal6b_functional_analysis_pseudo_bulk_SCP_EGFP_tumor
+step 7  anal7_cell_chat                                        per_ct
+step 7b anal7b_cell_chat_public
 
 # ---- record the environment -------------------------------------------------
 Rscript -e 'writeLines(capture.output(sessionInfo()), commandArgs(TRUE)[1])' \

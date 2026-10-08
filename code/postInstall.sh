@@ -23,7 +23,7 @@ $SUDO apt-get install -y libnode-dev || echo "libnode-dev not available, V8 will
 # Set CRAN_REPO to a dated Posit Package Manager snapshot matching the original run.
 # Ubuntu 24.04 (Noble) binary path:
 #   https://packagemanager.posit.co/cran/__linux__/noble/2026-06-12
-export CRAN_REPO="${CRAN_REPO:-https://packagemanager.posit.co/cran/__linux__/noble/YYYY-MM-DD}"
+export CRAN_REPO="${CRAN_REPO:-https://packagemanager.posit.co/cran/__linux__/noble/2026-06-12}"
 
 Rscript - <<'EOF'
 options(repos = c(CRAN = Sys.getenv("CRAN_REPO")), Ncpus = 4)
@@ -46,18 +46,13 @@ install.packages(c(
   "ggplot2", "patchwork", "ggrepel",
   "dplyr", "tidyr", "tibble", "purrr", "stringr",
   "here", "openxlsx", "viridis", "RColorBrewer",
-  "clustree", "scCustomize", "ggforce", "concaveman",
+  "clustree", "scCustomize", "ggforce", "V8", "concaveman",
   "msigdbr", "plotly", "htmlwidgets", "gridExtra", "ggridges",
   "reticulate", "FNN",
   "NMF", "circlize", "ggalluvial",           # CellChat dependencies
   "rmarkdown", "knitr"
 ))
 
-# msigdbr >= 10 keeps its gene sets in a separate package
-if (packageVersion("msigdbr") >= "10.0.0") {
-  install.packages("msigdbdf",
-    repos = c("https://igordot.r-universe.dev", Sys.getenv("CRAN_REPO")))
-}
 
 # GitHub — pin to a specific commit once your environment is finalised:
 #   remotes::install_github("immunogenomics/presto@<commit>")
@@ -97,12 +92,6 @@ pk <- c(
   # Gene sets
   "msigdbr"
 )
-
-# msigdbdf is only installed when msigdbr >= 10
-if (requireNamespace("msigdbr", quietly = TRUE) &&
-    packageVersion("msigdbr") >= "10.0.0") {
-  pk <- c(pk, "msigdbdf")
-}
 
 bad <- pk[!vapply(pk, requireNamespace, logical(1), quietly = TRUE)]
 if (length(bad)) stop("Failed to install: ", paste(bad, collapse = ", "))

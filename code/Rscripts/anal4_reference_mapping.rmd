@@ -98,176 +98,182 @@ if (!file.exists(atlas_file)){
     
   # ref_info is loaded from config.R
   
-  ref_names <- names(ref_info)
-  
-  refs <- lapply(ref_names, function(ref_name){
-  
-    message("Loading ", ref_name)
-  
-    obj <- readRDS(file.path(Data_public, ref_info[[ref_name]]$path))
-    obj <- UpdateSeuratObject(obj)
-  
-    obj$reference_source <- ref_name
-  
-    obj
-  })
-  
-  names(refs) <- ref_names 
-  
-  # list possibilities
-  for (ri in 1:length(refs)){
-    print(ref_names[ri])
-    print(unique(refs[[ri]]@meta.data[[ref_info[[ri]]$label_col]]))
-    print("")
+ref_names <- names(ref_info)
+
+refs <- lapply(ref_names, function(ref_name) {
+
+  # ── Look for a pre-downsampled raw file first ──────────────────────────────
+  # On Code Ocean, Published_objects contains these small files instead of the
+  # full originals (largest original: 26 GB).  When running locally with the
+  # full files, this path is absent and the full file is used instead.
+  ds_path <- file.path(published_dir,
+                       paste0("ref_", ref_name, "_downsampled_raw.rds"))
+
+  if (file.exists(ds_path)) {
+    message("Loading pre-downsampled: ", ref_name)
+    return(LoadSeuratRds(ds_path))           # already harmonized + downsampled
   }
-  
-  # # create harmonized annotation
-  # common_labels <- c(
-  #   "tumor", "SCP", "bridge", "CPC", "sympathoblast",
-  #   "chromaffin",  "prolif",  "immune", "mesenchymal",
-  #   "endothelial", "cortex", "kidney",   "liver",
-  #   "melanocyte",    "erythroid",   "HSC",
-  #   "unknown" ) # fallback
-  
-  # recode references
-  refs[["Jansky"]]$celltype_harmonized <- recode_labels(
-    refs[["Jansky"]]$celltype,
-    c(
-      "Tumor cells" = "tumor",
-      "Immune cells" = "other",
-      "Mesenchymal cells" = "mesenchymal",
-      "Endothelial cells" = "endothelial",
-      "Schwann cells" = "SCP",
-      "Liver cells" = "other"
-    )
+
+  # ── Full path: load raw file ───────────────────────────────────────────────
+  message("Loading ", ref_name)
+
+  obj <- readRDS(file.path(Data_public, ref_info[[ref_name]]$path))
+  obj <- UpdateSeuratObject(obj)
+
+  obj$reference_source <- ref_name
+
+  obj
+})
+
+names(refs) <- ref_names
+
+# list possibilities
+for (ri in 1:length(refs)){
+  print(ref_names[ri])
+  print(unique(refs[[ri]]@meta.data[[ref_info[[ri]]$label_col]]))
+  print("")
+}
+
+# recode references
+refs[["Jansky"]]$celltype_harmonized <- recode_labels(
+  refs[["Jansky"]]$celltype,
+  c(
+    "Tumor cells" = "tumor",
+    "Immune cells" = "other",
+    "Mesenchymal cells" = "mesenchymal",
+    "Endothelial cells" = "endothelial",
+    "Schwann cells" = "SCP",
+    "Liver cells" = "other"
   )
-  
-  refs[["Kameneva"]]$celltype_harmonized <- recode_labels(
-    refs[["Kameneva"]]$fate2,
-    c(
-      "SCP" = "SCP",
-      "sympathoblasts" = "sympathoblast",
-      "chromaffin" = "chromaffin",
-      "cortex" = "other",
-      "HSC_and_immune" = "other",
-      "erythroid" = "other",
-      "mesenchyme" = "mesenchymal",
-      "endothelium" = "endothelial",
-      "kidney" = "other",
-      "liver" = "other",
-      "melanocytes" = "other",
-      "intermediate_mesoderm" = "mesenchymal"
-    )
+)
+
+refs[["Kameneva"]]$celltype_harmonized <- recode_labels(
+  refs[["Kameneva"]]$fate2,
+  c(
+    "SCP" = "SCP",
+    "sympathoblasts" = "sympathoblast",
+    "chromaffin" = "chromaffin",
+    "cortex" = "other",
+    "HSC_and_immune" = "other",
+    "erythroid" = "other",
+    "mesenchyme" = "mesenchymal",
+    "endothelium" = "endothelial",
+    "kidney" = "other",
+    "liver" = "other",
+    "melanocytes" = "other",
+    "intermediate_mesoderm" = "mesenchymal"
   )
-  
-  
-  refs[["adr"]]$celltype_harmonized <- recode_labels(
-    refs[["adr"]]$Annotation,
-    c(
-      "SCPs" = "SCP",
-      "Bridge" = "bridge",
-      "Sympathoblastic" = "sympathoblast",
-      "Chromaffin" = "chromaffin",
-      "Cortex" = "other",
-      "Leukocytes" = "other",
-      "Mesenchyme" = "mesenchymal",
-      "Endothelium" = "endothelial",
-      "Erythroblasts" = "other",
-      "Other" = "other"
-    )
+)
+
+
+refs[["adr"]]$celltype_harmonized <- recode_labels(
+  refs[["adr"]]$Annotation,
+  c(
+    "SCPs" = "SCP",
+    "Bridge" = "bridge",
+    "Sympathoblastic" = "sympathoblast",
+    "Chromaffin" = "chromaffin",
+    "Cortex" = "other",
+    "Leukocytes" = "other",
+    "Mesenchyme" = "mesenchymal",
+    "Endothelium" = "endothelial",
+    "Erythroblasts" = "other",
+    "Other" = "other"
   )
-      
-  refs[["GOSH"]]$celltype_harmonized <- recode_labels(
-    refs[["GOSH"]]$Annotation,
-    c(
-      "Tumour cluster 1" = "tumor",
-      "Tumour cluster 2" = "tumor",
-      "Tumour cluster 3" = "tumor",
-      "Leukocytes" = "other",
-      "Mesenchyme" = "mesenchymal",
-      "Endothelium" = "endothelial"
-    )
-  )    
-      
-  refs[["PMC"]]$celltype_harmonized <- recode_labels(
-    refs[["PMC"]]$Annotation,
-    c(
-      "Tumour cluster 1" = "tumor",
-      "Tumour cluster 2" = "tumor",
-      "Tumour cluster 3" = "tumor",
-      "Schwannian stroma" = "SCP",
-      "Mesenchyme" = "mesenchymal",
-      "Leukocytes" = "other",
-      "Endothelium" = "endothelial",
-      "Ambiguous 1" = "other",
-      "Ambiguous 2" = "other"
-    )
+)
+
+refs[["GOSH"]]$celltype_harmonized <- recode_labels(
+  refs[["GOSH"]]$Annotation,
+  c(
+    "Tumour cluster 1" = "tumor",
+    "Tumour cluster 2" = "tumor",
+    "Tumour cluster 3" = "tumor",
+    "Leukocytes" = "other",
+    "Mesenchyme" = "mesenchymal",
+    "Endothelium" = "endothelial"
   )
-  
-  
-  refs[["Saldana"]]$celltype_harmonized <- recode_labels(
-    refs[["Saldana"]]$type3,
-    c(
-      "SCP" = "SCP",
-      "sympathoblasts" = "sympathoblast",
-      "chromaffin" = "chromaffin",
-      "mesenchyme" = "mesenchymal",
-      "other" = "other"
-    )
+)
+
+refs[["PMC"]]$celltype_harmonized <- recode_labels(
+  refs[["PMC"]]$Annotation,
+  c(
+    "Tumour cluster 1" = "tumor",
+    "Tumour cluster 2" = "tumor",
+    "Tumour cluster 3" = "tumor",
+    "Schwannian stroma" = "SCP",
+    "Mesenchyme" = "mesenchymal",
+    "Leukocytes" = "other",
+    "Endothelium" = "endothelial",
+    "Ambiguous 1" = "other",
+    "Ambiguous 2" = "other"
   )
-  
-  refs[["vanHaver"]]$celltype_harmonized <- recode_labels(
-    refs[["vanHaver"]]$seurat_clusters,
-    c(
-      "0" = "SCP",
-      "9" = "SCP",
-      "1" = "bridge",
-      "10" = "bridge",
-      "4" = "CPC",
-      "8" = "CPC",
-      "6" = "CPC",
-      "2" = "CPC",
-      "7" = "prolif",
-      "3" = "sympathoblast",
-      "5" = "sympathoblast"
-    )
+)
+
+
+refs[["Saldana"]]$celltype_harmonized <- recode_labels(
+  refs[["Saldana"]]$type3,
+  c(
+    "SCP" = "SCP",
+    "sympathoblasts" = "sympathoblast",
+    "chromaffin" = "chromaffin",
+    "mesenchyme" = "mesenchymal",
+    "other" = "other"
   )
-  
-  # sanity check:
-  lapply(refs, function(x) {
-    sort(table(x$celltype_harmonized), decreasing = TRUE)
-  })
-  
-  # check how much gets lost
-  lapply(refs, function(x) {
-    mean(x$celltype_harmonized == "other")
-  })
-  
-  # for (rname in names(refs)){
-  #   # there are a huge number of uknown -> remove
-  #   refs[[rname]] <- subset(
-  #     refs[[rname]],
-  #     subset = !celltype_harmonized %in% c("other")
-  #   )
-  # }
-  
-  # downsample huge populations
-  for(i in seq_along(refs)){
-  
-    Idents(refs[[i]]) <- "celltype_harmonized"
-    
-    print(table(refs[[i]]$celltype_harmonized))
-    
-    refs[[i]] <- subset(
-      refs[[i]],
-      downsample = 500
-    )
-    
-    # after downsampling
-    print("after downsampling:")
-    print(table(refs[[i]]$celltype_harmonized))
-    print("===")
+)
+
+refs[["vanHaver"]]$celltype_harmonized <- recode_labels(
+  refs[["vanHaver"]]$seurat_clusters,
+  c(
+    "0" = "SCP",
+    "9" = "SCP",
+    "1" = "bridge",
+    "10" = "bridge",
+    "4" = "CPC",
+    "8" = "CPC",
+    "6" = "CPC",
+    "2" = "CPC",
+    "7" = "prolif",
+    "3" = "sympathoblast",
+    "5" = "sympathoblast"
+  )
+)
+
+# sanity check:
+lapply(refs, function(x) {
+  sort(table(x$celltype_harmonized), decreasing = TRUE)
+})
+
+# check how much gets lost
+lapply(refs, function(x) {
+  mean(x$celltype_harmonized == "other")
+})
+
+# downsample huge populations
+for(i in seq_along(refs)){
+
+  Idents(refs[[i]]) <- "celltype_harmonized"
+
+  print(table(refs[[i]]$celltype_harmonized))
+
+  refs[[i]] <- subset(
+    refs[[i]],
+    downsample = 500
+  )
+
+  # after downsampling
+  print("after downsampling:")
+  print(table(refs[[i]]$celltype_harmonized))
+  print("===")
+}
+
+for (ref_name in ref_names) {
+  ds_path <- file.path(published_dir,
+                       paste0("ref_", ref_name, "_downsampled_raw.rds"))
+  if (!file.exists(ds_path)) {
+    message("Saving downsampled raw: ", ref_name)
+    SaveSeuratRds(refs[[ref_name]], file = ds_path)
   }
+}
   
   # ---------------------------------------------------------------------------
   # Create harmonized, transformed, downsampled reference files
